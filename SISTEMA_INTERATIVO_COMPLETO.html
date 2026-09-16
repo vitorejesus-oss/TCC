@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏭 Sistema Automação Usinagem | Grand Prix SENAI 2025</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #667eea;
+            --secondary: #764ba2;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --info: #3b82f6;
+            --neutral: #f3f4f6;
+            --dark: #1f2937;
+            --light: #6b7280;
+            --border: #e5e7eb;
+        }
+
+        html, body {
+            height: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--neutral);
+            color: var(--dark);
+        }
+
+        body {
+            display: grid;
+            grid-template-columns: 260px 1fr;
+        }
+
+        /* ==================== SIDEBAR ==================== */
+        .sidebar {
+            background: linear-gradient(180deg, #1f2937, #111827);
+            color: white;
+            padding: 25px;
+            overflow-y: auto;
+            box-shadow: 2px 0 15px rgba(0,0,0,0.1);
+        }
+
+        .logo {
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 35px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid rgba(102, 126, 234, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .nav-section {
+            margin-bottom: 35px;
+        }
+
+        .nav-title {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.4);
+            margin-bottom: 15px;
+            letter-spacing: 1.5px;
+            font-weight: 700;
+        }
+
+        .nav-item {
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-left: 3px solid transparent;
+            user-select: none;
+        }
+
+        .nav-item:hover {
+            background: rgba(255,255,255,0.1);
+            transform: translateX(4px);
+        }
+
+        .nav-item.active {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            font-weight: 600;
+            border-left-color: #fff;
+        }
+
+        /* ==================== MAIN ==================== */
+        .main {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            background: white;
+            padding: 20px 35px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+
+        .header h1 {
+            font-size: 26px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-right {
+            display: flex;
+            gap: 25px;
+            align-items: center;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--success);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: white;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .time-display {
+            font-size: 12px;
+            color: var(--light);
+            text-align: right;
+        }
+
+        .time-display div {
+            margin: 2px 0;
+        }
+
+        /* ==================== CONTENT ==================== */
+        .content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 25px;
+        }
+
+        .content.grid-2 { grid-template-columns: repeat(2, 1fr); }
+        .content.grid-3 { grid-template-columns: repeat(3, 1fr); }
+        .content.grid-4 { grid-template-columns: repeat(4, 1fr); }
+
+        /* ==================== CARDS ==================== */
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            border: 1px solid var(--border);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--dark);
+            border-bottom: 2px solid var(--primary);
+            padding-bottom: 15px;
+        }
+
+        /* ==================== MÉTRICAS ==================== */
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 15px;
+        }
+
+        .metric {
+            background: linear-gradient(135deg, #f5f7fa 0%, #e9ecef 100%);
+            padding: 18px;
+            border-radius: 10px;
+            text-align: center;
+            border-left: 4px solid var(--primary);
+            transition: all 0.3s ease;
+        }
+
+        .metric:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+        }
+
+        .metric-icon {
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+            margin: 8px 0;
+        }
+
+        .metric-label {
+            font-size: 11px;
+            color: var(--light);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* ==================== TABELAS ==================== */
+        .table-wrapper {
+            overflow-x: auto;
+            border-radius: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        thead {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+
+        th {
+            padding: 14px;
+            text-align: left;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 10px;
+            letter-spacing: 1px;
+        }
+
+        td {
+            padding: 14px;
+            border-bottom: 1px solid var(--border);
+            color: var(--dark);
+        }
+
+        tbody tr:hover {
+            background: #f9fafb;
+        }
+
+        tbody tr.urgent {
+            border-left: 3px solid var(--danger);
+            background: #fef2f2;
+        }
+
+        /* ==================== BADGES ==================== */
+        .badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .badge-success { background: #d1fae5; color: #065f46; }
+        .badge-warning { background: #fef3c7; color: #92400e; }
+        .badge-danger { background: #fee2e2; color: #991b1b; }
+        .badge-info { background: #dbeafe; color: #0c2d6b; }
+
+        /* ==================== ALERTAS ==================== */
+        .alert {
+            background: #fee2e2;
+            border-left: 4px solid var(--danger);
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            display: flex;
+            gap: 12px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .alert.warning { background: #fef3c7; border-left-color: var(--warning); }
+        .alert.info { background: #dbeafe; border-left-color: var(--info); }
+
+        @keyframes slideIn {
+            from { transform: translateX(-20px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        .alert-icon { font-size: 20px; min-width: 24px; }
+        .alert-title { font-weight: 700; margin-bottom: 4px; }
+        .alert-message { font-size: 12px; line-height: 1.5; }
+
+        /* ==================== TIMELINE ==================== */
+        .timeline {
+            position: relative;
+            padding: 20px 0;
+        }
+
+        .timeline-item {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .timeline-dot {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--primary);
+            flex-shrink: 0;
+            margin-top: 2px;
+            border: 3px solid white;
+            box-shadow: 0 0 0 2px var(--primary);
+        }
+
+        .timeline-dot.completed {
+            background: var(--success);
+            box-shadow: 0 0 0 2px var(--success);
+        }
+
+        .timeline-time {
+            font-weight: 700;
+            color: var(--dark);
+            font-size: 13px;
+        }
+
+        .timeline-desc {
+            font-size: 12px;
+            color: var(--light);
+            margin-top: 3px;
+        }
+
+        /* ==================== GRÁFICOS ==================== */
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin-top: 15px;
+        }
+
+        /* ==================== DISPONIBILIDADE ==================== */
+        .availability-bar {
+            display: flex;
+            height: 40px;
+            border-radius: 8px;
+            overflow: hidden;
+            margin: 12px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .availability-segment {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 10px;
+            font-weight: 700;
+            transition: all 0.3s;
+        }
+
+        .seg-free { background: var(--success); }
+        .seg-occupied { background: var(--info); }
+        .seg-maintenance { background: var(--warning); }
+
+        /* ==================== HIDDEN ==================== */
+        .hidden { display: none !important; }
+
+        /* ==================== SCROLL ==================== */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--neutral);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        /* ==================== RESPONSIVO ==================== */
+        @media (max-width: 1400px) {
+            .content.grid-3 { grid-template-columns: repeat(2, 1fr); }
+            .content.grid-4 { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        @media (max-width: 768px) {
+            body { grid-template-columns: 1fr; }
+            .sidebar { display: none; }
+            .content, .content.grid-2, .content.grid-3, .content.grid-4 { 
+                grid-template-columns: 1fr; 
+            }
+            .header { flex-direction: column; gap: 15px; }
+            .header-right { flex-direction: column; width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+        <div class="logo">⚙️ AUTOMAÇÃO USINAGEM</div>
+        
+        <div class="nav-section">
+            <div class="nav-title">📊 Dashboard</div>
+            <div class="nav-item active" onclick="navegar('dashboard')">📈 Visão Geral</div>
+            <div class="nav-item" onclick="navegar('aderencia')">📊 Aderência Máquinas</div>
+            <div class="nav-item" onclick="navegar('timeline')">⏱️ Timeline Operacional</div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-title">🏭 Operacional</div>
+            <div class="nav-item" onclick="navegar('operador')">⚙️ Painel Operador</div>
+            <div class="nav-item" onclick="navegar('gestao')">👔 Painel Gestão</div>
+            <div class="nav-item" onclick="navegar('alertas')">🚨 Alertas Críticos</div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-title">📋 Gestão</div>
+            <div class="nav-item" onclick="navegar('fila')">📝 Fila de Demanda</div>
+            <div class="nav-item" onclick="navegar('maquinas')">🔧 Disponibilidade</div>
+            <div class="nav-item" onclick="navegar('economia')">💰 Economia Realizada</div>
+        </div>
+    </div>
+
+    <!-- MAIN -->
+    <div class="main">
+        <!-- HEADER -->
+        <div class="header">
+            <h1 id="page-title">📈 Visão Geral do Sistema</h1>
+            <div class="header-right">
+                <div class="status-badge">
+                    <div class="status-dot"></div>
+                    Sistema Online
+                </div>
+                <div class="time-display">
+                    <div id="data-hora"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT DASHBOARD -->
+        <div class="content grid-4" id="dashboard">
+            <div class="card">
+                <div class="card-title">📊 Métricas Operacionais</div>
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-icon">📝</div>
+                        <div class="metric-value" id="val-notas">28</div>
+                        <div class="metric-label">Notas Criadas</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-icon">✅</div>
+                        <div class="metric-value" id="val-processadas">24</div>
+                        <div class="metric-label">OS Processadas</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-icon">⏳</div>
+                        <div class="metric-value" id="val-pendentes">4</div>
+                        <div class="metric-label">Pendentes</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-icon">📈</div>
+                        <div class="metric-value">98%</div>
+                        <div class="metric-label">Taxa Aderência</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">💰 Impacto (ANTES vs DEPOIS)</div>
+                <div style="font-size: 12px; line-height: 1.8;">
+                    <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
+                        <strong>⏱️ Tempo/Nota:</strong>
+                        <div style="color: var(--danger); font-size: 11px;">45 min → <span style="color: var(--success);">3 min</span></div>
+                        <div style="color: var(--light); font-size: 10px;">Redução: 93%</div>
+                    </div>
+                    <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
+                        <strong>❌ Taxa Erro:</strong>
+                        <div style="color: var(--danger); font-size: 11px;">28% → <span style="color: var(--success);">0%</span></div>
+                        <div style="color: var(--light); font-size: 10px;">Eliminação: 100%</div>
+                    </div>
+                    <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
+                        <strong>⚡ Custo Retrabalho:</strong>
+                        <div style="color: var(--danger); font-size: 11px;">R$ 890/sem → <span style="color: var(--success);">R$ 0</span></div>
+                        <div style="color: var(--light); font-size: 10px;">Economia: 100%</div>
+                    </div>
+                    <div>
+                        <strong>📊 Economia/Mês:</strong>
+                        <div style="color: var(--success); font-weight: 700; font-size: 14px; margin-top: 4px;">R$ 7.147</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">🏆 Status Máquinas (Hoje)</div>
+                <div style="font-size: 12px;">
+                    <div style="margin-bottom: 12px;">
+                        <strong>CENTUR</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 3;">3h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 4;">4h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="color: var(--light); font-size: 10px; margin-top: 4px;">✅ Aderência: 98%</div>
+                    </div>
+                    <div style="margin-bottom: 12px;">
+                        <strong>D1250</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 2;">2h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 5;">5h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="color: var(--light); font-size: 10px; margin-top: 4px;">✅ Aderência: 95%</div>
+                    </div>
+                    <div>
+                        <strong>FRESADORA</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 1;">1h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 6;">6h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="color: var(--warning); font-size: 10px; margin-top: 4px;">⚠️ Aderência: 90%</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">📈 Gráfico Aderência</div>
+                <div class="chart-container">
+                    <canvas id="chart1"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT ADERÊNCIA -->
+        <div class="content grid-2 hidden" id="aderencia">
+            <div class="card">
+                <div class="card-title">📊 Aderência por Máquina (Mês)</div>
+                <div class="chart-container">
+                    <canvas id="chartAder"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">📈 Série Histórica</div>
+                <div class="chart-container">
+                    <canvas id="chartHist"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT TIMELINE -->
+        <div class="content hidden" id="timeline">
+            <div class="card">
+                <div class="card-title">⏱️ Timeline de Operações - Hoje (15/01/2025)</div>
+                <div class="timeline">
+                    <div class="timeline-item">
+                        <div class="timeline-dot completed"></div>
+                        <div>
+                            <div class="timeline-time">08:00 - 09:45</div>
+                            <div class="timeline-desc">OS-001 | CENTUR | Placa Bronze | ✅ CONCLUÍDA</div>
+                        </div>
+                    </div>
+                    <div class="timeline-item">
+                        <div class="timeline-dot completed"></div>
+                        <div>
+                            <div class="timeline-time">09:45 - 11:15</div>
+                            <div class="timeline-desc">OS-002 | D1250 | Acabamento | ✅ CONCLUÍDA</div>
+                        </div>
+                    </div>
+                    <div class="timeline-item">
+                        <div class="timeline-dot"></div>
+                        <div>
+                            <div class="timeline-time">11:30 - 13:20</div>
+                            <div class="timeline-desc">OS-003 | FRESADORA | Eixo Esticador | ▶ EXECUTANDO (65%)</div>
+                        </div>
+                    </div>
+                    <div class="timeline-item">
+                        <div class="timeline-dot"></div>
+                        <div>
+                            <div class="timeline-time">13:30 - 15:00</div>
+                            <div class="timeline-desc">OS-004 | CENTUR | Mancal | ⏳ AGUARDANDO</div>
+                        </div>
+                    </div>
+                    <div class="timeline-item">
+                        <div class="timeline-dot"></div>
+                        <div>
+                            <div class="timeline-time">15:15 - 17:00</div>
+                            <div class="timeline-desc">OS-005 | POLITRIZ | Polimento | 📋 PLANEJADO</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT OPERADOR -->
+        <div class="content hidden" id="operador">
+            <div class="card">
+                <div class="card-title">⚙️ Painel do Operador</div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>OS</th>
+                                <th>Nota</th>
+                                <th>Peça</th>
+                                <th>Máquina</th>
+                                <th>Início</th>
+                                <th>Fim</th>
+                                <th>% Concluído</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>OS-001</strong></td>
+                                <td>NOT-001</td>
+                                <td>Placa Bronze</td>
+                                <td>CENTUR</td>
+                                <td>08:00</td>
+                                <td>09:45</td>
+                                <td>100%</td>
+                                <td><span class="badge badge-success">✓ Concluída</span></td>
+                            </tr>
+                            <tr>
+                                <td><strong>OS-003</strong></td>
+                                <td>NOT-003</td>
+                                <td>Eixo Esticador</td>
+                                <td>FRESADORA</td>
+                                <td>11:30</td>
+                                <td>13:20</td>
+                                <td>65%</td>
+                                <td><span class="badge badge-info">▶ Executando</span></td>
+                            </tr>
+                            <tr>
+                                <td><strong>OS-004</strong></td>
+                                <td>NOT-004</td>
+                                <td>Mancal Inferior</td>
+                                <td>CENTUR</td>
+                                <td>13:30</td>
+                                <td>15:00</td>
+                                <td>0%</td>
+                                <td><span class="badge badge-warning">⏳ Aguardando</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT GESTÃO -->
+        <div class="content grid-2 hidden" id="gestao">
+            <div class="card">
+                <div class="card-title">👔 Aderência Acumulada (Máquinas)</div>
+                <div style="font-size: 12px;">
+                    <div style="margin-bottom: 15px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+                            <strong>CENTUR</strong>
+                            <span style="color: var(--success); font-weight: 700;">98%</span>
+                        </div>
+                        <div style="height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;">
+                            <div style="height: 100%; width: 98%; background: var(--success);"></div>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 15px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+                            <strong>D1250</strong>
+                            <span style="color: var(--success); font-weight: 700;">95%</span>
+                        </div>
+                        <div style="height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;">
+                            <div style="height: 100%; width: 95%; background: var(--success);"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+                            <strong>FRESADORA</strong>
+                            <span style="color: var(--warning); font-weight: 700;">90%</span>
+                        </div>
+                        <div style="height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;">
+                            <div style="height: 100%; width: 90%; background: var(--warning);"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">📊 Atividades em Execução</div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Máquina</th>
+                                <th>OS Vigente</th>
+                                <th>% Concluído</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>CENTUR</strong></td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td><span class="badge badge-success">✓ Livre</span></td>
+                            </tr>
+                            <tr>
+                                <td><strong>D1250</strong></td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td><span class="badge badge-success">✓ Livre</span></td>
+                            </tr>
+                            <tr>
+                                <td><strong>FRESADORA</strong></td>
+                                <td>OS-003</td>
+                                <td>65%</td>
+                                <td><span class="badge badge-info">▶ Usinando</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT ALERTAS -->
+        <div class="content hidden" id="alertas">
+            <div class="card">
+                <div class="card-title">🚨 Alertas e Avisos Críticos</div>
+                
+                <div class="alert">
+                    <div class="alert-icon">⚠️</div>
+                    <div>
+                        <div class="alert-title">Aderência Crítica: FRESADORA</div>
+                        <div class="alert-message">Máquina com 90% de aderência (limite crítico: 92%). OS-003 pode atrasar 15 minutos. Recomendação: verificar se próxima OS pode ser antecipada.</div>
+                    </div>
+                </div>
+
+                <div class="alert" style="border-left-color: var(--danger); background: #fee2e2;">
+                    <div class="alert-icon">❌</div>
+                    <div>
+                        <div class="alert-title">Nota em Atraso: NOT-006</div>
+                        <div class="alert-message">Nota pedida para 14/01 ainda está em VALIDAÇÃO. Solicitante não confirmou coordenador responsável. Impacto: atraso de 1 dia.</div>
+                    </div>
+                </div>
+
+                <div class="alert warning" style="border-left-color: var(--warning); background: #fef3c7;">
+                    <div class="alert-icon">⏳</div>
+                    <div>
+                        <div class="alert-title">Reprogramação Necessária: OS-004</div>
+                        <div class="alert-message">OS estava planejada para hoje 13:30, mas CENTUR vai ficar ocupada até 15h. Proposta: adiar para amanhã 08:00 (coordenador deve confirmar).</div>
+                    </div>
+                </div>
+
+                <div class="alert info" style="border-left-color: var(--info); background: #dbeafe;">
+                    <div class="alert-icon">ℹ️</div>
+                    <div>
+                        <div class="alert-title">Nova Nota Recebida: NOT-007 (URGENTE)</div>
+                        <div class="alert-message">Nota imediata aprovada pelo gestor. Sistema aguardando criação automática de OS. Peça com histórico encontrado ✅. Tempo estimado: 3 minutos.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT FILA -->
+        <div class="content hidden" id="fila">
+            <div class="card">
+                <div class="card-title">📋 Fila de Demanda Pública (12 Filtros)</div>
+                
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px;">
+                    <input type="text" placeholder="🔍 Status" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="📝 Nota" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="📦 OS" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="👤 Solicitante" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="📍 Local" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="⚙️ Equipamento" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="📋 Descrição" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="text" placeholder="🎯 Tipo" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="date" placeholder="📅 Dt. Entrega Insumo" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="date" placeholder="⚙️ Dt. Usinagem" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="date" placeholder="🎁 Dt. Coleta" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                    <input type="number" placeholder="📊 % Realizada" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px;">
+                </div>
+
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Status</th>
+                                <th>Nota</th>
+                                <th>OS</th>
+                                <th>Peça</th>
+                                <th>Solicitante</th>
+                                <th>Local</th>
+                                <th>Tipo</th>
+                                <th>% Realizada</th>
+                                <th>Usinagem</th>
+                                <th>Dias Atrasados</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="badge badge-success">✓ Finalizado</span></td>
+                                <td>NOT-001</td>
+                                <td>OS-001</td>
+                                <td>Placa Bronze</td>
+                                <td>JOTUANDERSON</td>
+                                <td>FAM-AVB-LAQ</td>
+                                <td>Normal</td>
+                                <td>100%</td>
+                                <td>15/01</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-info">▶ Usinando</span></td>
+                                <td>NOT-003</td>
+                                <td>OS-003</td>
+                                <td>Eixo Esticador</td>
+                                <td>GERENCIA</td>
+                                <td>FAM-AVB-LAQ</td>
+                                <td>Imediato</td>
+                                <td>65%</td>
+                                <td>15/01</td>
+                                <td>0</td>
+                            </tr>
+                            <tr class="urgent">
+                                <td><span class="badge badge-warning">⏳ Planejamento</span></td>
+                                <td>NOT-006</td>
+                                <td>OS-006</td>
+                                <td>Corrente</td>
+                                <td>OPERACAO</td>
+                                <td>FAM-AVB-LAQ</td>
+                                <td>Imediato</td>
+                                <td>0%</td>
+                                <td>14/01</td>
+                                <td>1</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT MÁQUINAS -->
+        <div class="content grid-2 hidden" id="maquinas">
+            <div class="card">
+                <div class="card-title">🔧 Disponibilidade de Máquinas (Hoje)</div>
+                <div style="font-size: 12px;">
+                    <div style="margin-bottom: 18px;">
+                        <strong style="display: block; margin-bottom: 8px;">CENTUR (Livre)</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 3;">3h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 4;">4h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="margin-top: 6px; font-size: 10px; color: var(--light);">3 + 4 + 1 = 8h</div>
+                    </div>
+
+                    <div style="margin-bottom: 18px;">
+                        <strong style="display: block; margin-bottom: 8px;">D1250 (Livre)</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 2;">2h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 5;">5h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="margin-top: 6px; font-size: 10px; color: var(--light);">2 + 5 + 1 = 8h</div>
+                    </div>
+
+                    <div>
+                        <strong style="display: block; margin-bottom: 8px;">FRESADORA (Crítica)</strong>
+                        <div class="availability-bar">
+                            <div class="availability-segment seg-free" style="flex: 1;">1h</div>
+                            <div class="availability-segment seg-occupied" style="flex: 6;">6h</div>
+                            <div class="availability-segment seg-maintenance" style="flex: 1;">1h</div>
+                        </div>
+                        <div style="margin-top: 6px; font-size: 10px; color: var(--warning); font-weight: 700;">⚠️ Apenas 1h livre</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">📊 Disponibilidade (Próxima Semana)</div>
+                <div class="chart-container">
+                    <canvas id="chartDisp"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTENT ECONOMIA -->
+        <div class="content hidden" id="economia">
+            <div class="card">
+                <div class="card-title">💰 Análise de Economia Realizada</div>
+                <div style="font-size: 12px; line-height: 1.8;">
+                    <div style="background: #d1fae5; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                        <strong style="color: #065f46; display: block; margin-bottom: 6px;">💵 Economia Esta Semana:</strong>
+                        <div style="font-size: 22px; color: #065f46; font-weight: 700;">R$ 1.265</div>
+                        <div style="font-size: 11px; color: #047857; margin-top: 4px;">Calculado a partir de 28 notas processadas</div>
+                    </div>
+
+                    <div style="margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border);">
+                        <strong>⏱️ Redução de Tempo:</strong>
+                        <div style="margin-top: 6px; font-size: 11px;">28 notas × 42 min economizados = <span style="font-weight: 700; color: var(--success);">19.6 horas/semana</span></div>
+                        <div style="font-size: 10px; color: var(--light); margin-top: 3px;">Equivalente a 2.5 dias de trabalho manual</div>
+                    </div>
+
+                    <div style="margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border);">
+                        <strong>❌ Eliminação de Retrabalho:</strong>
+                        <div style="margin-top: 6px; font-size: 11px;">0 erros × 30 min = <span style="font-weight: 700; color: var(--success);">0 horas</span> de retrabalho</div>
+                        <div style="font-size: 10px; color: var(--light); margin-top: 3px;">Economia de R$ 0 em correções</div>
+                    </div>
+
+                    <div style="margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border);">
+                        <strong>⏳ Redução de Horas Extras:</strong>
+                        <div style="margin-top: 6px; font-size: 11px;">2.1 horas extras (vs 5h esperado) = <span style="font-weight: 700; color: var(--success);">-2.9h/semana</span></div>
+                        <div style="font-size: 10px; color: var(--light); margin-top: 3px;">Economia: R$ 217 em horas extras</div>
+                    </div>
+
+                    <div style="background: #dbeafe; padding: 14px; border-radius: 8px;">
+                        <strong style="color: #0c2d6b; display: block; margin-bottom: 8px;">📈 Projeção Mensal:</strong>
+                        <div style="font-size: 20px; color: #0c2d6b; font-weight: 700;">R$ 5.060</div>
+                        <div style="font-size: 10px; color: #1e40af; margin-top: 4px;">R$ 1.265 × 4 semanas (conservador)</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // DADOS SIMULADOS
+        const dados = {
+            notas: 28,
+            processadas: 24,
+            pendentes: 4
+        };
+
+        // NAVEGAÇÃO
+        function navegar(secao) {
+            document.querySelectorAll('[id^="dashboard"], [id^="aderencia"], [id^="timeline"], [id^="operador"], [id^="gestao"], [id^="alertas"], [id^="fila"], [id^="maquinas"], [id^="economia"]').forEach(el => {
+                el.classList.add('hidden');
+            });
+            document.querySelectorAll('.nav-item').forEach(el => {
+                el.classList.remove('active');
+            });
+
+            document.getElementById(secao).classList.remove('hidden');
+            event.target.classList.add('active');
+
+            const titles = {
+                dashboard: '📈 Visão Geral do Sistema',
+                aderencia: '📊 Aderência de Máquinas',
+                timeline: '⏱️ Timeline de Operações',
+                operador: '⚙️ Painel do Operador',
+                gestao: '👔 Painel de Gestão',
+                alertas: '🚨 Alertas Críticos',
+                fila: '📋 Fila de Demanda Pública',
+                maquinas: '🔧 Disponibilidade de Máquinas',
+                economia: '💰 Economia Realizada'
+            };
+            document.getElementById('page-title').textContent = titles[secao];
+        }
+
+        // RELÓGIO
+        setInterval(() => {
+            const agora = new Date();
+            document.getElementById('data-hora').innerHTML = 
+                agora.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' }) + '<br>' +
+                agora.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }, 1000);
+
+        // GRÁFICOS
+        setTimeout(() => {
+            const ctx1 = document.getElementById('chart1');
+            if (ctx1) new Chart(ctx1, {
+                type: 'bar',
+                data: {
+                    labels: ['CENTUR', 'D1250', 'FRESADORA', 'POLITRIZ'],
+                    datasets: [{ label: 'Aderência (%)', data: [98, 95, 90, 96], backgroundColor: ['#10b981', '#10b981', '#f59e0b', '#10b981'], borderRadius: 6 }]
+                },
+                options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { max: 100 } } }
+            });
+
+            const ctxAder = document.getElementById('chartAder');
+            if (ctxAder) new Chart(ctxAder, {
+                type: 'radar',
+                data: {
+                    labels: ['CENTUR', 'D1250', 'FRESADORA', 'POLITRIZ'],
+                    datasets: [{ label: 'Aderência (%)', data: [98, 95, 90, 96], borderColor: '#667eea', backgroundColor: 'rgba(102, 126, 234, 0.2)' }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top' } } }
+            });
+
+            const ctxHist = document.getElementById('chartHist');
+            if (ctxHist) new Chart(ctxHist, {
+                type: 'line',
+                data: {
+                    labels: ['Sem 1', 'Sem 2', 'Sem 3', 'Sem 4'],
+                    datasets: [{ label: 'CENTUR', data: [92, 94, 96, 98], borderColor: '#667eea', backgroundColor: 'rgba(102, 126, 234, 0.1)', tension: 0.4 }, { label: 'D1250', data: [88, 90, 93, 95], borderColor: '#764ba2', backgroundColor: 'rgba(118, 75, 162, 0.1)', tension: 0.4 }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top' } } }
+            });
+
+            const ctxDisp = document.getElementById('chartDisp');
+            if (ctxDisp) new Chart(ctxDisp, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Disponível', 'Ocupada', 'Manutenção'],
+                    datasets: [{ data: [25, 60, 15], backgroundColor: ['#10b981', '#3b82f6', '#f59e0b'] }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+            });
+        }, 100);
+    </script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+═════════════════════════════════════════════════════════════════════════════════
+TODO AGORA - ADICIONAR FOTOS (5-10 MINUTOS)
+═════════════════════════════════════════════════════════════════════════════════
+
+📋 ARQUIVOS A BAIXAR DAQUI:
+   1. setup_fotos_maquinas.py
+   2. GUIA_ADICIONAR_FOTOS.md
+
+📍 ONDE BAIXAR ESSES 2 ARQUIVOS:
+   Estão na pasta: /home/claude/
+   Baixe ambos e coloque em: C:\Users\vitor\OneDrive\Documentos\Desktop\TCC.VITOR\
+
+═════════════════════════════════════════════════════════════════════════════════
+PASSOS RÁPIDOS:
+═════════════════════════════════════════════════════════════════════════════════
+
+1️⃣ PREPARAR PASTA:
+   C:\Users\vitor\...\TCC.VITOR\fotos_maquinas\
+   (criar pasta com 8 imagens com nomes corretos)
+
+2️⃣ RODAR SCRIPT:
+   cd C:\Users\vitor\...\TCC.VITOR
+   python setup_fotos_maquinas.py
+   (rodar UMA VEZ)
+
+3️⃣ TESTAR LOCALMENTE:
+   Terminal 1: python app.py
+   Terminal 2: cd frontend && npm run dev
+   Abrir: http://localhost:5173
+   Aba: 🔧 Manutenção
+   Resultado esperado: VER 8 FOTOS
+
+4️⃣ FAZER COMMIT + PUSH:
+   git add .
+   git commit -m "feat: fotos máquinas"
+   git push
+
+5️⃣ VERIFICAR EM PRODUÇÃO:
+   https://frontend-xi-two-5l7d05gqtg.vercel.app
+   Login: operador@fabrica.com / Vitor367
+   Aba: 🔧 Manutenção
+   Resultado esperado: VER 8 FOTOS (em produção também)
+
+═════════════════════════════════════════════════════════════════════════════════
+DÚVIDA? Abre o arquivo: GUIA_ADICIONAR_FOTOS.md
+
+PRONTO? Prosseguir pra próxima fase:
+   - Desenhos técnicos profissional
+   - Telegram Bot melhorias
+   - 10 fases profissionalização
+═════════════════════════════════════════════════════════════════════════════════

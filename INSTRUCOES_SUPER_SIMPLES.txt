@@ -1,0 +1,97 @@
+═════════════════════════════════════════════════════════════════════════════════
+                    ✅ SETUP AUTOMÁTICO - 3 PASSOS SIMPLES
+═════════════════════════════════════════════════════════════════════════════════
+
+BAIXE ESTES 3 ARQUIVOS:
+   1. SETUP_AUTOMATICO.bat
+   2. setup_fotos_maquinas.py
+   3. fotos_maquinas_prontas.zip
+
+═════════════════════════════════════════════════════════════════════════════════
+PASSO 1: EXTRAIR ZIP
+═════════════════════════════════════════════════════════════════════════════════
+
+1. Baixar: fotos_maquinas_prontas.zip
+2. Extrair na pasta: C:\Users\vitor\OneDrive\Documentos\Desktop\TCC.VITOR\
+   
+   Resultado esperado:
+   C:\Users\vitor\...\TCC.VITOR\fotos_maquinas\
+   ├── maquina_01_torno_horizontal.jpg
+   ├── maquina_02_torno_vertical.webp
+   ├── maquina_03_fresadora_universal.webp
+   ├── maquina_04_mandrilhadora.jpg
+   ├── maquina_05_furadeira_radial.jpeg
+   ├── maquina_06_serra_fita.jpg
+   ├── maquina_07_torno_cnc_cilindros.jpeg
+   └── maquina_08_retificadora_cilindrica.jpeg
+
+═════════════════════════════════════════════════════════════════════════════════
+PASSO 2: RODAR O SCRIPT AUTOMÁTICO
+═════════════════════════════════════════════════════════════════════════════════
+
+1. Ter certeza que tá na pasta: C:\Users\vitor\...\TCC.VITOR\
+2. Ter certeza que tem:
+   - SETUP_AUTOMATICO.bat (baixado)
+   - setup_fotos_maquinas.py (baixado)
+   - fotos_maquinas/ (pasta com 8 imagens, extraída do ZIP)
+   - usinagem.db (já deve estar lá)
+
+3. CLICAR 2X em: SETUP_AUTOMATICO.bat
+
+Você vai ver:
+   ✅ Verificando...
+   ✅ Preparando pasta...
+   ✅ Executando setup...
+   ✅ SETUP COMPLETO!
+
+(Aguarde alguns segundos, é tudo automático)
+
+═════════════════════════════════════════════════════════════════════════════════
+PASSO 3: FAZER GIT PUSH
+═════════════════════════════════════════════════════════════════════════════════
+
+Abrir PowerShell na pasta TCC.VITOR\:
+
+git add .
+git commit -m "feat: adicionar fotos das 8 máquinas"
+git push
+
+Aguardar ~2 minutos.
+
+═════════════════════════════════════════════════════════════════════════════════
+PRONTO!
+═════════════════════════════════════════════════════════════════════════════════
+
+Abrir em produção:
+   https://frontend-xi-two-5l7d05gqtg.vercel.app
+   
+Login: operador@fabrica.com / Vitor367
+
+Clicar na aba: 🔧 Manutenção
+
+Você deve VER as 8 fotos das máquinas!
+
+═════════════════════════════════════════════════════════════════════════════════
+SE NÃO FUNCIONAR:
+═════════════════════════════════════════════════════════════════════════════════
+
+❌ SETUP_AUTOMATICO.bat não abre:
+   → Renomear para: SETUP_AUTOMATICO.cmd
+   → Tentar clicar de novo
+
+❌ Erro Python:
+   → Abrir PowerShell
+   → Verificar: python --version
+   → Se não tiver Python instalado: install.python.org
+
+❌ Erro "usinagem.db not found":
+   → Ter certeza que tá na pasta certa
+   → C:\Users\vitor\OneDrive\Documentos\Desktop\TCC.VITOR\
+
+❌ Nada disso funcionou:
+   → Abrir arquivo GUIA_ADICIONAR_FOTOS.md (guia completo)
+   → Fazer os passos manualmente
+
+═════════════════════════════════════════════════════════════════════════════════
+TEMPO TOTAL: 5 MINUTOS
+═════════════════════════════════════════════════════════════════════════════════

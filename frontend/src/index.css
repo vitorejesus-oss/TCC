@@ -1,0 +1,359 @@
+:root {
+  --azul-escuro: #0F3A7D;
+  --azul-medio: #1E5BA8;
+  --azul-claro: #E8F0F7;
+  --branco: #FFFFFF;
+  --cinza-bg: #F8F9FA;
+  --cinza-borda: #E9ECEF;
+  --cinza-texto: #495057;
+  --cinza-escuro: #212529;
+  --verde: #28A745;
+  --vermelho: #DC3545;
+  --amarelo: #FFC107;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+  background-color: var(--cinza-bg);
+  color: var(--cinza-texto);
+  line-height: 1.6;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+a {
+  color: var(--azul-medio);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--cinza-escuro);
+  font-weight: 600;
+}
+
+button {
+  font-size: 14px;
+  border: none;
+  border-radius: 4px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+input:not([type="file"]), select, textarea {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--cinza-borda);
+  border-radius: 4px;
+  background-color: var(--branco);
+  color: var(--cinza-texto);
+  transition: border-color 0.2s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--azul-medio);
+  box-shadow: 0 0 0 3px rgba(30, 91, 168, 0.1);
+}
+
+input::placeholder {
+  color: #999;
+}
+
+/* Modal "Ver Mais" (Feature 2) */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.modal {
+  background: var(--branco);
+  border-radius: 8px;
+  padding: 30px;
+  max-width: 600px;
+  width: 100%;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  position: relative;
+}
+
+.modal-close {
+  position: absolute;
+  top: 15px;
+  right: 15px;
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  color: var(--cinza-texto);
+  padding: 0;
+}
+
+.modal-close:hover {
+  color: var(--cinza-escuro);
+}
+
+.modal-section {
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--cinza-borda);
+}
+
+.modal-section:last-of-type {
+  border-bottom: none;
+}
+
+.modal-section h3 {
+  color: var(--azul-escuro);
+  margin-bottom: 10px;
+}
+
+.modal-section p {
+  margin: 8px 0;
+  color: var(--cinza-texto);
+}
+
+.modal-section small {
+  color: #999;
+}
+
+.historico-list {
+  background: var(--cinza-bg);
+  border-radius: 4px;
+  padding: 10px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.historico-item {
+  padding: 8px;
+  border-bottom: 1px solid var(--cinza-borda);
+  font-size: 12px;
+}
+
+.historico-item:last-child {
+  border-bottom: none;
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+  justify-content: flex-end;
+}
+
+.btn-primary {
+  background: var(--azul-escuro);
+  color: var(--branco);
+  border: none;
+  padding: 10px 20px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  background: var(--azul-medio);
+}
+
+/* Aba Manutenção (Feature 3) */
+.maquinas-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.card-maquina {
+  background: var(--branco);
+  border: 1px solid var(--cinza-borda);
+  border-radius: 8px;
+  padding: 20px;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card-maquina:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.card-maquina h3 {
+  margin: 0 0 10px 0;
+  color: var(--azul-escuro);
+  font-size: 16px;
+}
+
+.card-maquina p {
+  margin: 5px 0;
+  color: var(--cinza-texto);
+  font-size: 13px;
+}
+
+.btn-danger {
+  background: var(--vermelho);
+  color: var(--branco);
+  border: none;
+  padding: 10px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-danger:hover {
+  background: #b02a37;
+}
+
+.btn-danger:disabled,
+.btn-success:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-success {
+  background: var(--verde);
+  color: var(--branco);
+  border: none;
+  padding: 10px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-success:hover {
+  background: #1f8838;
+}
+
+.btn-secondary {
+  background: var(--cinza-bg);
+  color: var(--cinza-texto);
+  border: 1px solid var(--cinza-borda);
+  padding: 10px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-block;
+  text-decoration: none;
+}
+
+.btn-secondary:hover {
+  background: var(--cinza-borda);
+}
+
+/* Chat de Manutenção (Feature 4) */
+.chat-manutencao {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 420px;
+  background: var(--branco);
+  border: 1px solid var(--cinza-borda);
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.chat-manutencao h2 {
+  margin: 0;
+  color: var(--azul-escuro);
+  font-size: 16px;
+}
+
+.chat-historico {
+  flex: 1;
+  overflow-y: auto;
+  margin-bottom: 15px;
+  padding: 10px;
+  background: var(--cinza-bg);
+  border-radius: 4px;
+  min-height: 200px;
+}
+
+.chat-vazio {
+  text-align: center;
+  color: #999;
+  padding: 20px;
+}
+
+.chat-msg {
+  margin-bottom: 12px;
+  padding: 10px;
+  background: var(--branco);
+  border-radius: 4px;
+  border-left: 3px solid var(--azul-escuro);
+}
+
+.msg-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 5px;
+  gap: 8px;
+}
+
+.msg-role {
+  font-weight: bold;
+  font-size: 12px;
+}
+
+.msg-header small {
+  color: #999;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.msg-texto {
+  margin: 5px 0 0 0;
+  color: var(--cinza-texto);
+  font-size: 13px;
+  word-wrap: break-word;
+}
+
+.chat-input {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-input input {
+  flex: 1;
+  padding: 10px;
+  font-size: 13px;
+}
+
+.chat-input button {
+  background: var(--azul-escuro);
+  color: var(--branco);
+  border: none;
+  padding: 10px 15px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.chat-input button:hover {
+  background: var(--azul-medio);
+}
+
+.chat-input button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

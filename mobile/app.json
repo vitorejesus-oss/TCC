@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Servidor Privado",
+    "slug": "servidor-privado-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "backgroundColor": "#0F172A"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.suaempresa.servidorprivado"
+    },
+    "android": {
+      "package": "com.suaempresa.servidorprivado",
+      "permissions": ["NOTIFICATIONS"]
+    },
+    "plugins": ["expo-notifications"],
+    "extra": {
+      "eas": {
+        "projectId": "COLOQUE-AQUI-SE-USAR-EAS-BUILD"
+      }
+    }
+  }
+}
