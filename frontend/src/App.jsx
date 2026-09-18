@@ -5,6 +5,52 @@ const BACKEND_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 const API_URL = `${BACKEND_URL}/api`;
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || BACKEND_URL;
 
+// Os 10 botões soltos viraram 5 módulos. As telas e os ids de `tab` são
+// os mesmos de antes — só a navegação mudou, nenhum painel foi tocado.
+// PLANEJAMENTO entra aqui na Fase 3, junto com a Timeline.
+const MODULOS = [
+  {
+    id: 'demandas',
+    nome: 'Demandas',
+    telas: [
+      { id: 'notas', nome: 'Abrir nota' },
+      { id: 'sap', nome: 'Importação SAP' },
+    ],
+  },
+  {
+    id: 'producao',
+    nome: 'Produção',
+    telas: [
+      { id: 'operador', nome: 'Fila de trabalho' },
+    ],
+  },
+  {
+    id: 'ativos',
+    nome: 'Manutenção',
+    telas: [
+      { id: 'manutencao', nome: 'Máquinas' },
+    ],
+  },
+  {
+    id: 'gestao',
+    nome: 'Gestão',
+    telas: [
+      { id: 'gestao', nome: 'Indicadores' },
+      { id: 'estatisticas', nome: 'Estatísticas' },
+      { id: 'relatorio', nome: 'Relatório' },
+      { id: 'auditoria', nome: 'Auditoria' },
+      { id: 'backup', nome: 'Backup' },
+    ],
+  },
+  {
+    id: 'acesso',
+    nome: 'Acesso',
+    telas: [
+      { id: 'login', nome: 'Login' },
+    ],
+  },
+];
+
 // Feature 2 - Modal "Ver Mais": detalhes completos de uma nota.
 // Definida FORA do componente principal (não aninhada) de propósito: se
 // ficasse aninhada, cada re-render de SistemaAutomacao (o polling de 10s,
@@ -198,7 +244,7 @@ function ChatManutencao({ token, socket }) {
 
   return (
     <div className="chat-manutencao">
-      <h2 style={{ marginBottom: 15 }}>💬 Chat - Manutenção</h2>
+      <h2 style={{ marginBottom: 15 }}>Chat — Manutenção</h2>
 
       {!token && (
         <p style={{ color: 'var(--cinza-texto)', fontSize: 13 }}>
@@ -298,6 +344,15 @@ function ModalMaquina({ maquina, token, onClose, onUpdate }) {
         <h2>🔧 {maquina.nome}</h2>
 
         <section className="modal-section">
+          {maquina.foto_url && (
+            <section className="modal-section">
+              <img 
+                src={`${BACKEND_URL}/fotos_maquinas/${maquina.foto_url}`}
+                alt={maquina.nome}
+                style={{ width: '100%', height: 250, objectFit: 'contain', borderRadius: 4, marginBottom: 12 }}
+              />
+            </section>
+          )}
           <p><strong>Local:</strong> {maquina.localizacao || '-'}</p>
           {maquina.modelo && <p><strong>Modelo:</strong> {maquina.modelo}</p>}
           {maquina.fabricante && <p><strong>Fabricante:</strong> {maquina.fabricante}</p>}
@@ -363,7 +418,7 @@ function PainelManutencao({ maquinas, token, selectedMaquina, setSelectedMaquina
 
   return (
     <div className="painel">
-      <h2 style={{ marginBottom: 20 }}>🔧 Manutenção de Máquinas</h2>
+      <h2 style={{ marginBottom: 20 }}>Manutenção de Máquinas</h2>
 
       <div className="maquinas-grid">
         {maquinas.map((maq) => (
@@ -402,6 +457,7 @@ export default function SistemaAutomacao() {
   // ============================================================================
 
   const [tab, setTab] = useState('operador');
+  const [modulo, setModulo] = useState('producao');
   const [notas, setNotas] = useState([]);
   const [ordens, setOrdens] = useState([]);
   const [pecas, setPecas] = useState([]);
@@ -427,7 +483,7 @@ export default function SistemaAutomacao() {
   const [usuarioLogado, setUsuarioLogado] = useState(() => localStorage.getItem('usuario') || '');
   const [role, setRole] = useState(() => localStorage.getItem('role') || '');
   const [loginEmail, setLoginEmail] = useState('operador@fabrica.com');
-  const [loginSenha, setLoginSenha] = useState('123456');
+  const [loginSenha, setLoginSenha] = useState('Vitor367');
   const [loginErro, setLoginErro] = useState(null);
   const [painelProtegido, setPainelProtegido] = useState(null);
 
@@ -458,6 +514,14 @@ export default function SistemaAutomacao() {
     const intervalo = setInterval(carregarDados, 10000); // Atualizar a cada 10s
     return () => clearInterval(intervalo);
   }, []);
+
+  // Carrega os dados de Backup e Estatísticas quando a tela é aberta,
+  // uma vez por abertura. Antes esses fetch ficavam dentro dos painéis,
+  // que são recriados a cada render — o efeito disparava a cada poll.
+  useEffect(() => {
+    if (tab === 'backup') carregarBackups();
+    if (tab === 'estatisticas') carregarEstatisticas();
+  }, [tab]);
 
   // Diferencial #4 - conecta ao WebSocket uma única vez
   useEffect(() => {
@@ -670,7 +734,7 @@ export default function SistemaAutomacao() {
   function PainelOperador() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>⚙️ Fila de Trabalho</h2>
+        <h2 style={{ marginBottom: 20 }}>Fila de Trabalho</h2>
         <div className="tabela-wrapper">
           <table>
             <thead>
@@ -713,7 +777,7 @@ export default function SistemaAutomacao() {
 
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>📊 Métricas e Impacto</h2>
+        <h2 style={{ marginBottom: 20 }}>Métricas e Impacto</h2>
 
         <div className="cards-grid">
           <div className="card-metrica">
@@ -784,7 +848,7 @@ export default function SistemaAutomacao() {
   function PainelNotas() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>📝 Criar Nova Nota</h2>
+        <h2 style={{ marginBottom: 20 }}>Criar Nova Nota</h2>
 
         <div className="form-grupo">
           <label>Selecione uma peça:</label>
@@ -861,7 +925,7 @@ export default function SistemaAutomacao() {
   function PainelAuditoria() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>🔍 Auditoria e Rastreamento</h2>
+        <h2 style={{ marginBottom: 20 }}>Auditoria e Rastreamento</h2>
 
         <div className="tabela-wrapper">
           <table>
@@ -893,7 +957,7 @@ export default function SistemaAutomacao() {
   function PainelSap() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>📥 Importação SAP</h2>
+        <h2 style={{ marginBottom: 20 }}>Importação SAP</h2>
         <p style={{ marginBottom: 20, color: 'var(--cinza-texto)' }}>
           Envie um arquivo SAP (tab-separated) com as colunas NOTNUM, MATERIAL, QTD, DUEDATE, URGENTE.
         </p>
@@ -967,7 +1031,7 @@ export default function SistemaAutomacao() {
   function PainelRelatorio() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>📄 Relatório de Economia (PDF)</h2>
+        <h2 style={{ marginBottom: 20 }}>Relatório de Economia (PDF)</h2>
 
         <div className="form-grupo" style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           <select value={mesRelatorio} onChange={(e) => setMesRelatorio(e.target.value)}>
@@ -992,11 +1056,9 @@ export default function SistemaAutomacao() {
 
   // Painel BACKUP (Diferencial #6)
   function PainelBackup() {
-    useEffect(() => { carregarBackups(); }, []);
-
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>💾 Backup do Banco de Dados</h2>
+        <h2 style={{ marginBottom: 20 }}>Backup do Banco de Dados</h2>
 
         <button className="btn-nota" style={{ width: 'auto', padding: '12px 24px' }} onClick={criarBackup} disabled={criandoBackup}>
           {criandoBackup ? 'Criando...' : 'Criar Backup Agora'}
@@ -1028,13 +1090,11 @@ export default function SistemaAutomacao() {
 
   // Painel ESTATÍSTICAS (Diferencial #10)
   function PainelEstatisticas() {
-    useEffect(() => { carregarEstatisticas(); }, []);
-
     if (!estatisticas) return <div className="painel">Carregando...</div>;
 
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>📈 Estatísticas Customizadas</h2>
+        <h2 style={{ marginBottom: 20 }}>Estatísticas Customizadas</h2>
 
         <h3>Desempenho por máquina</h3>
         <div className="tabela-wrapper" style={{ marginBottom: 24 }}>
@@ -1079,7 +1139,7 @@ export default function SistemaAutomacao() {
   function PainelLogin() {
     return (
       <div className="painel">
-        <h2 style={{ marginBottom: 20 }}>🔐 Login (JWT) e Área Protegida</h2>
+        <h2 style={{ marginBottom: 20 }}>Login e Área Protegida</h2>
 
         {!token ? (
           <form onSubmit={fazerLogin} className="form-grupo" style={{ maxWidth: 360 }}>
@@ -1090,7 +1150,7 @@ export default function SistemaAutomacao() {
             <button className="btn-nota" type="submit" style={{ width: 'auto', padding: '12px 24px' }}>Entrar</button>
             {loginErro && <p style={{ color: 'var(--vermelho)', marginTop: 12 }}>{loginErro}</p>}
             <p style={{ marginTop: 16, color: 'var(--cinza-texto)', fontSize: 13 }}>
-              Usuários demo: operador@fabrica.com / coordenador@fabrica.com / gestor@fabrica.com / diretor@fabrica.com — senha 123456
+              Usuários demo: operador@fabrica.com / coordenador@fabrica.com / gestor@fabrica.com / diretor@fabrica.com — senha Vitor367
             </p>
           </form>
         ) : (
@@ -1114,297 +1174,24 @@ export default function SistemaAutomacao() {
     );
   }
 
+  // Trocar de módulo leva para a primeira tela dele.
+  function abrirModulo(moduloId) {
+    const m = MODULOS.find((x) => x.id === moduloId);
+    if (!m) return;
+    setModulo(moduloId);
+    setTab(m.telas[0].id);
+  }
+
   // ============================================================================
   // RENDER PRINCIPAL
   // ============================================================================
 
   return (
     <div className="container">
-      <style>{`
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
-
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-          background: var(--cinza-bg);
-        }
-
-        .container {
-          max-width: 1400px;
-          margin: 0 auto;
-          padding: 20px;
-        }
-
-        .header {
-          background: var(--azul-escuro);
-          color: var(--branco);
-          padding: 30px;
-          border-radius: 8px;
-          margin-bottom: 30px;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          flex-wrap: wrap;
-          gap: 16px;
-          box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-
-        .header h1 {
-          font-size: 28px;
-          margin-bottom: 10px;
-        }
-
-        .header p {
-          opacity: 0.9;
-        }
-
-        .ws-indicador {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          background: rgba(255,255,255,0.15);
-          padding: 10px 16px;
-          border-radius: 20px;
-          font-size: 13px;
-        }
-
-        .ws-bolinha {
-          width: 10px;
-          height: 10px;
-          border-radius: 50%;
-        }
-
-        .tabs {
-          display: flex;
-          gap: 10px;
-          margin-bottom: 30px;
-          background: var(--branco);
-          border: 1px solid var(--cinza-borda);
-          padding: 15px;
-          border-radius: 8px;
-          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-          flex-wrap: wrap;
-        }
-
-        .tab-btn {
-          padding: 12px 24px;
-          border: 2px solid transparent;
-          background: transparent;
-          color: var(--cinza-texto);
-          cursor: pointer;
-          font-weight: 600;
-          border-radius: 4px;
-          transition: all 0.2s ease;
-        }
-
-        .tab-btn.active {
-          background: var(--azul-medio);
-          color: var(--branco);
-        }
-
-        .tab-btn:hover {
-          background: var(--cinza-bg);
-        }
-
-        .painel {
-          background: var(--branco);
-          border: 1px solid var(--cinza-borda);
-          border-radius: 8px;
-          padding: 30px;
-          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-
-        .tabela-wrapper {
-          overflow-x: auto;
-        }
-
-        table {
-          width: 100%;
-          border-collapse: collapse;
-        }
-
-        thead {
-          background: var(--azul-escuro);
-          color: var(--branco);
-        }
-
-        th {
-          padding: 16px;
-          text-align: left;
-          font-weight: 600;
-          font-size: 12px;
-          text-transform: uppercase;
-        }
-
-        td {
-          padding: 16px;
-          border-bottom: 1px solid var(--cinza-borda);
-          color: var(--cinza-texto);
-        }
-
-        tbody tr:hover {
-          background: var(--cinza-bg);
-        }
-
-        .status-badge {
-          display: inline-block;
-          background: var(--azul-claro);
-          color: var(--azul-escuro);
-          padding: 6px 12px;
-          border-radius: 20px;
-          font-size: 11px;
-          font-weight: 600;
-        }
-
-        .badge-urgente {
-          color: var(--vermelho);
-          font-weight: 700;
-        }
-
-        .badge-normal {
-          color: var(--verde);
-        }
-
-        .btn-pequeno {
-          padding: 8px 16px;
-          background: var(--azul-medio);
-          color: var(--branco);
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          font-weight: 600;
-          font-size: 12px;
-          transition: background-color 0.2s ease;
-        }
-
-        .btn-pequeno:hover {
-          background: var(--azul-escuro);
-        }
-
-        .cards-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-          gap: 20px;
-          margin-bottom: 30px;
-        }
-
-        .card-metrica {
-          background: var(--azul-claro);
-          padding: 20px;
-          border-radius: 8px;
-          text-align: center;
-          border: 1px solid var(--cinza-borda);
-          border-top: 3px solid var(--azul-medio);
-        }
-
-        .metrica-icon {
-          font-size: 40px;
-          margin-bottom: 10px;
-        }
-
-        .metrica-label {
-          color: var(--cinza-texto);
-          font-size: 12px;
-          text-transform: uppercase;
-          margin-bottom: 10px;
-          letter-spacing: 0.5px;
-        }
-
-        .metrica-valor {
-          font-size: 28px;
-          font-weight: 700;
-          background: linear-gradient(135deg, var(--azul-escuro), var(--azul-medio));
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          background-clip: text;
-        }
-
-        .form-grupo {
-          margin-bottom: 20px;
-        }
-
-        .form-grupo label {
-          display: block;
-          font-weight: 600;
-          margin-bottom: 15px;
-          color: var(--cinza-escuro);
-        }
-
-        .botoes-grupo {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-          gap: 10px;
-        }
-
-        .btn-nota {
-          padding: 12px;
-          background: var(--azul-medio);
-          color: var(--branco);
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          font-weight: 600;
-          transition: all 0.2s ease;
-        }
-
-        .btn-nota:hover {
-          background: var(--azul-escuro);
-          box-shadow: 0 4px 10px rgba(15, 58, 125, 0.25);
-        }
-
-        .btn-nota:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-        }
-
-        .btn-urgente {
-          padding: 12px;
-          background: var(--vermelho);
-          color: var(--branco);
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          font-weight: 600;
-          transition: all 0.2s ease;
-        }
-
-        .btn-urgente:hover {
-          background: #b02a37;
-          box-shadow: 0 4px 10px rgba(220, 53, 69, 0.3);
-        }
-
-        h2, h3 {
-          color: var(--cinza-escuro);
-          margin-bottom: 20px;
-        }
-
-        .feed-tempo-real {
-          background: var(--branco);
-          border: 1px solid var(--cinza-borda);
-          border-radius: 8px;
-          padding: 16px 20px;
-          margin-bottom: 20px;
-          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-
-        .feed-tempo-real ul {
-          list-style: none;
-          font-size: 13px;
-          color: var(--cinza-texto);
-        }
-
-        .feed-tempo-real li {
-          padding: 4px 0;
-          border-bottom: 1px solid var(--cinza-borda);
-        }
-      `}</style>
 
       <div className="header">
         <div>
-          <h1>🏭 Sistema de Automação de Usinagem</h1>
+          <h1>Sistema de Automação de Usinagem</h1>
           <p>Grand Prix SENAI 2025 | Pentágono Mecânico</p>
         </div>
         <div className="ws-indicador">
@@ -1434,18 +1221,40 @@ export default function SistemaAutomacao() {
         </div>
       )}
 
-      <div className="tabs">
-        <button className={`tab-btn ${tab === 'operador' ? 'active' : ''}`} onClick={() => setTab('operador')}>⚙️ Operador</button>
-        <button className={`tab-btn ${tab === 'gestao' ? 'active' : ''}`} onClick={() => setTab('gestao')}>📊 Gestão</button>
-        <button className={`tab-btn ${tab === 'notas' ? 'active' : ''}`} onClick={() => setTab('notas')}>📝 Criar Nota</button>
-        <button className={`tab-btn ${tab === 'auditoria' ? 'active' : ''}`} onClick={() => setTab('auditoria')}>🔍 Auditoria</button>
-        <button className={`tab-btn ${tab === 'sap' ? 'active' : ''}`} onClick={() => setTab('sap')}>📥 SAP</button>
-        <button className={`tab-btn ${tab === 'relatorio' ? 'active' : ''}`} onClick={() => setTab('relatorio')}>📄 Relatório</button>
-        <button className={`tab-btn ${tab === 'backup' ? 'active' : ''}`} onClick={() => setTab('backup')}>💾 Backup</button>
-        <button className={`tab-btn ${tab === 'estatisticas' ? 'active' : ''}`} onClick={() => setTab('estatisticas')}>📈 Estatísticas</button>
-        <button className={`tab-btn ${tab === 'login' ? 'active' : ''}`} onClick={() => setTab('login')}>🔐 Login</button>
-        <button className={`tab-btn ${tab === 'manutencao' ? 'active' : ''}`} onClick={() => setTab('manutencao')}>🔧 Manutenção</button>
-      </div>
+      {(() => {
+        const moduloAtual = MODULOS.find((m) => m.id === modulo) || MODULOS[0];
+        const temSubmenu = moduloAtual.telas.length > 1;
+
+        return (
+          <>
+            <div className={`modulos ${temSubmenu ? '' : 'sozinho'}`}>
+              {MODULOS.map((m) => (
+                <button
+                  key={m.id}
+                  className={`modulo-btn ${modulo === m.id ? 'active' : ''}`}
+                  onClick={() => abrirModulo(m.id)}
+                >
+                  {m.nome}
+                </button>
+              ))}
+            </div>
+
+            {temSubmenu && (
+              <div className="telas">
+                {moduloAtual.telas.map((t) => (
+                  <button
+                    key={t.id}
+                    className={`tela-btn ${tab === t.id ? 'active' : ''}`}
+                    onClick={() => setTab(t.id)}
+                  >
+                    {t.nome}
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {tab === 'operador' && <PainelOperador />}
       {tab === 'gestao' && <PainelGestao />}

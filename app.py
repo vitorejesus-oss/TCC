@@ -26,7 +26,7 @@ import bcrypt
 import requests
 import schedule
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from flask_jwt_extended import (
@@ -1317,6 +1317,10 @@ def get_pecas():
     pecas = [dict(row) for row in c.fetchall()]
     conn.close()
     return jsonify(pecas)
+
+@app.route('/fotos_maquinas/<filename>')
+def serve_foto(filename):
+    return send_from_directory('fotos_maquinas', filename)
 
 @app.route('/api/maquinas', methods=['GET'])
 def get_maquinas():

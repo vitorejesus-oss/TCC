@@ -1,0 +1,104 @@
+CREATE TABLE pecas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo TEXT UNIQUE NOT NULL,
+        nome TEXT NOT NULL,
+        descricao TEXT,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+
+CREATE TABLE sqlite_sequence(name,seq)
+
+CREATE TABLE operacoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        peca_id INTEGER NOT NULL,
+        sequencia INTEGER NOT NULL,
+        maquina TEXT NOT NULL,
+        tempo_estimado INTEGER NOT NULL,
+        descricao TEXT,
+        FOREIGN KEY(peca_id) REFERENCES pecas(id),
+        UNIQUE(peca_id, sequencia)
+    )
+
+CREATE TABLE maquinas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT UNIQUE NOT NULL,
+        status TEXT DEFAULT 'DISPONIVEL',
+        ultima_manutencao TIMESTAMP,
+        proxima_manutencao TIMESTAMP
+    , localizacao TEXT, foto_url TEXT, manual_url TEXT, ultimo_conserto TIMESTAMP, modelo TEXT, fabricante TEXT)
+
+CREATE TABLE notas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero TEXT UNIQUE NOT NULL,
+        peca_codigo TEXT NOT NULL,
+        quantidade INTEGER NOT NULL,
+        prioridade TEXT DEFAULT 'NORMAL',
+        solicitante TEXT,
+        status TEXT DEFAULT 'RECEBIDA',
+        criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        validada_em TIMESTAMP,
+        FOREIGN KEY(peca_codigo) REFERENCES pecas(codigo)
+    )
+
+CREATE TABLE ordens_servico (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero TEXT UNIQUE NOT NULL,
+        nota_id INTEGER NOT NULL,
+        status TEXT DEFAULT 'PLANEJAMENTO',
+        prioridade TEXT DEFAULT 'NORMAL',
+        tempo_total INTEGER,
+        tempo_inicio TIMESTAMP,
+        tempo_fim TIMESTAMP,
+        criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        concluida_em TIMESTAMP,
+        FOREIGN KEY(nota_id) REFERENCES notas(id)
+    )
+
+CREATE TABLE alocacao_maquinas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ordem_servico_id INTEGER NOT NULL,
+        maquina_id INTEGER NOT NULL,
+        sequencia INTEGER NOT NULL,
+        status TEXT DEFAULT 'PLANEJADO',
+        inicio_planejado TIMESTAMP,
+        fim_planejado TIMESTAMP,
+        inicio_real TIMESTAMP,
+        fim_real TIMESTAMP,
+        FOREIGN KEY(ordem_servico_id) REFERENCES ordens_servico(id),
+        FOREIGN KEY(maquina_id) REFERENCES maquinas(id)
+    )
+
+CREATE TABLE auditoria (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tipo_evento TEXT NOT NULL,
+        entidade TEXT NOT NULL,
+        entidade_id INTEGER,
+        descricao TEXT,
+        usuario TEXT DEFAULT 'SISTEMA',
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+
+CREATE TABLE usuarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        senha_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+
+CREATE TABLE relatorios_manutencao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        maquina_id INTEGER NOT NULL,
+        usuario TEXT,
+        descricao TEXT,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(maquina_id) REFERENCES maquinas(id)
+    )
+
+CREATE TABLE chat_manutencao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario TEXT NOT NULL,
+        role TEXT,
+        mensagem TEXT NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
