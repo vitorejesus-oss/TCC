@@ -305,9 +305,9 @@ def registrar_auditoria(tipo, entidade, entidade_id, descricao):
     conn = get_db()
     c = conn.cursor()
     c.execute('''INSERT INTO auditoria
-                 (tipo_evento, entidade, entidade_id, descricao)
-                 VALUES (?, ?, ?, ?)''',
-              (tipo, entidade, entidade_id, descricao))
+                 (tipo_evento, entidade, entidade_id, descricao, criado_em)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (tipo, entidade, entidade_id, descricao, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -900,16 +900,23 @@ class AutomacaoUsinagem:
             prioridade = 'URGENTE' if nota['prioridade'] == 'URGENTE' else 'NORMAL'
 
             c.execute('''INSERT INTO ordens_servico
-                        (numero, nota_id, status, prioridade, tempo_total)
-                        VALUES (?, ?, ?, ?, ?)''',
-                     (numero_os, nota_id, 'PLANEJAMENTO', prioridade, tempo_total))
+                        (numero, nota_id, status, prioridade, tempo_total, criada_em)
+                        VALUES (?, ?, ?, ?, ?, ?)''',
+                     (numero_os, nota_id, 'PLANEJAMENTO', prioridade, tempo_total,
+                      datetime.now().isoformat()))
 
             os_id = c.lastrowid
 
             tempo_inicio = datetime.now()
+            alocacoes_em_maquina_parada = []
             for op in operacoes:
-                c.execute('SELECT id FROM maquinas WHERE nome = ?', (op['maquina'],))
+                c.execute('SELECT id, status FROM maquinas WHERE nome = ?', (op['maquina'],))
                 maquina = c.fetchone()
+
+                # Planejar para máquina parada é permitido (ela pode voltar),
+                # mas fica registrado na auditoria depois do commit.
+                if maquina['status'] == 'QUEBRADA':
+                    alocacoes_em_maquina_parada.append((op['sequencia'], op['maquina']))
 
                 tempo_fim = tempo_inicio + timedelta(minutes=op['tempo_estimado'])
 
@@ -922,13 +929,21 @@ class AutomacaoUsinagem:
 
                 tempo_inicio = tempo_fim
 
-            c.execute('''UPDATE notas SET status = ?, validada_em = CURRENT_TIMESTAMP
-                        WHERE id = ?''', ('PROCESSADA', nota_id))
+            c.execute('''UPDATE notas SET status = ?, validada_em = ?
+                        WHERE id = ?''',
+                     ('PROCESSADA', datetime.now().isoformat(), nota_id))
 
             conn.commit()
 
             registrar_auditoria('PROCESSAMENTO', 'NOTA', nota_id,
                               f'Nota processada automaticamente. OS: {numero_os}')
+
+            for sequencia, nome_maquina in alocacoes_em_maquina_parada:
+                registrar_auditoria(
+                    'ALOCACAO_EM_MAQUINA_PARADA', 'ORDEM_SERVICO', os_id,
+                    f'{numero_os}: operação {sequencia} planejada na máquina '
+                    f'{nome_maquina}, que está QUEBRADA'
+                )
 
             MonitorTempoReal.notificar_nota_processada({
                 'os': numero_os,
@@ -1029,11 +1044,11 @@ class IntegradorSAP:
                     nota_dict['ja_processada'] = True
                 else:
                     c.execute('''INSERT INTO notas
-                                (numero, peca_codigo, quantidade, prioridade, solicitante, status)
-                                VALUES (?, ?, ?, ?, ?, ?)''',
+                                (numero, peca_codigo, quantidade, prioridade, solicitante, status, criada_em)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)''',
                              (numero_nota, material, quantidade,
                               'URGENTE' if urgente else 'NORMAL',
-                              'SAP_IMPORT', 'RECEBIDA'))
+                              'SAP_IMPORT', 'RECEBIDA', datetime.now().isoformat()))
                     conn.commit()
                     nota_id = c.lastrowid
 
@@ -1224,11 +1239,11 @@ def criar_nota():
         numero = f"NOT-{datetime.now().strftime('%Y%m%d%H%M')}-{int(datetime.now().microsecond/1000)}"
 
         c.execute('''INSERT INTO notas
-                    (numero, peca_codigo, quantidade, prioridade, solicitante, status)
-                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (numero, peca_codigo, quantidade, prioridade, solicitante, status, criada_em)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
                  (numero, data.get('peca_codigo'), data.get('quantidade', 1),
                   data.get('prioridade', 'NORMAL'), data.get('solicitante'),
-                  'RECEBIDA'))
+                  'RECEBIDA', datetime.now().isoformat()))
 
         conn.commit()
         nota_id = c.lastrowid
@@ -1306,12 +1321,25 @@ def get_ordem(os_id):
     return jsonify(resultado)
 
 @app.route('/api/ordens-servico/<int:os_id>/iniciar', methods=['POST'])
+@jwt_required()
 def iniciar_ordem(os_id):
     """Inicia execução de uma OS"""
+    email = get_jwt_identity()
     conn = get_db()
     c = conn.cursor()
 
     try:
+        # Máquina parada não recebe produção: confere antes de mudar qualquer coisa.
+        c.execute('''SELECT m.nome AS maquina_nome, m.status AS maquina_status
+                     FROM alocacao_maquinas am
+                     JOIN maquinas m ON m.id = am.maquina_id
+                     WHERE am.ordem_servico_id = ? AND am.sequencia = 1''', (os_id,))
+        primeira = c.fetchone()
+        if primeira and primeira['maquina_status'] == 'QUEBRADA':
+            return jsonify({
+                'erro': f"Máquina {primeira['maquina_nome']} está parada"
+            }), 409
+
         tempo_agora = datetime.now()
 
         c.execute('''UPDATE ordens_servico
@@ -1320,9 +1348,9 @@ def iniciar_ordem(os_id):
                  ('USINANDO', tempo_agora.isoformat(), os_id))
 
         c.execute('''UPDATE alocacao_maquinas
-                    SET status = ?, inicio_real = ?
+                    SET status = ?, inicio_real = ?, operador = ?
                     WHERE ordem_servico_id = ? AND sequencia = 1''',
-                 ('EXECUTANDO', tempo_agora.isoformat(), os_id))
+                 ('EXECUTANDO', tempo_agora.isoformat(), email, os_id))
 
         conn.commit()
         registrar_auditoria('INICIO', 'ORDEM_SERVICO', os_id, 'Execução iniciada')
@@ -1660,10 +1688,10 @@ def marcar_maquina_consertada(maquina_id):
               (agora.isoformat(), maquina_id))
 
     c.execute('''INSERT INTO relatorios_manutencao
-                 (maquina_id, usuario, descricao, quebrada_em, tempo_reparo_min)
-                 VALUES (?, ?, ?, ?, ?)''',
+                 (maquina_id, usuario, descricao, quebrada_em, tempo_reparo_min, criado_em)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
               (maquina_id, email, relatorio,
-               maquina['quebrada_em'], tempo_reparo))
+               maquina['quebrada_em'], tempo_reparo, agora.isoformat()))
     conn.commit()
     conn.close()
 
@@ -1712,8 +1740,8 @@ def enviar_chat_manutencao():
 
     conn = get_db()
     c = conn.cursor()
-    c.execute('INSERT INTO chat_manutencao (usuario, role, mensagem) VALUES (?, ?, ?)',
-             (email, role, mensagem))
+    c.execute('INSERT INTO chat_manutencao (usuario, role, mensagem, criado_em) VALUES (?, ?, ?, ?)',
+             (email, role, mensagem, datetime.now().isoformat()))
     conn.commit()
     msg_id = c.lastrowid
     c.execute('SELECT * FROM chat_manutencao WHERE id = ?', (msg_id,))

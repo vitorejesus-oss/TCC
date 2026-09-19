@@ -603,7 +603,15 @@ export default function SistemaAutomacao() {
 
   async function iniciarOrdem(os_id) {
     try {
-      await fetch(`${API_URL}/ordens-servico/${os_id}/iniciar`, { method: 'POST' });
+      const res = await fetch(`${API_URL}/ordens-servico/${os_id}/iniciar`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        const erro = await res.json().catch(() => ({}));
+        alert(erro.erro || erro.msg || 'Erro ao iniciar ordem');
+        return;
+      }
       await carregarDados();
     } catch (e) {
       alert('Erro ao iniciar ordem');
