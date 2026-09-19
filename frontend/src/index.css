@@ -711,3 +711,219 @@ input::placeholder, textarea::placeholder { color: #8A97A6; }
   .tela-btn { padding: 10px 11px; }
   .chat-historico { max-height: 300px; }
 }
+
+/* ------------------------------------------------------- programação --- */
+
+.prog-topo {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.prog-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--cinza-texto);
+  letter-spacing: 0.04em;
+}
+
+.prog-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prog-nav input[type='date'] {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.prog-legenda {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 14px;
+  font-size: 11.5px;
+  color: var(--cinza-texto);
+}
+
+.prog-legenda span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.prog-legenda i {
+  width: 14px;
+  height: 10px;
+  display: block;
+  border-radius: 1px;
+}
+
+.prog-hachura {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--cinza-escuro) 0 2px,
+    transparent 2px 4px
+  );
+  border: 1px solid var(--cinza-escuro);
+}
+
+.prog-wrapper {
+  border: 1px solid var(--cinza-borda);
+  border-radius: var(--raio);
+  overflow-x: auto;
+}
+
+.prog-eixo,
+.prog-linha {
+  display: flex;
+  align-items: stretch;
+  min-width: 760px;
+}
+
+.prog-eixo {
+  background: var(--fundo-sutil);
+  border-bottom: 1px solid var(--cinza-borda);
+  height: 30px;
+}
+
+.prog-rotulo-vazio,
+.prog-rotulo {
+  width: 168px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--cinza-borda);
+  padding: 7px 11px;
+}
+
+.prog-marcas {
+  position: relative;
+  flex-grow: 1;
+}
+
+.prog-marcas span {
+  position: absolute;
+  top: 7px;
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--cinza-texto);
+  white-space: nowrap;
+}
+
+.prog-linha {
+  border-bottom: 1px solid var(--linha-suave);
+  min-height: 46px;
+}
+
+.prog-linha:last-child { border-bottom: 0; }
+
+.prog-rotulo {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  background: var(--painel);
+}
+
+.prog-rotulo strong { font-size: 12.5px; }
+
+.prog-rotulo small {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--cinza-texto);
+  letter-spacing: 0.04em;
+}
+
+.prog-rotulo.parada {
+  border-left: 3px solid var(--vermelho);
+  background: #FCEDEB;
+}
+
+.prog-rotulo.parada small { color: var(--vermelho); font-weight: 600; }
+
+.prog-faixa {
+  position: relative;
+  flex-grow: 1;
+  background: var(--painel);
+}
+
+.prog-grade {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--linha-suave);
+}
+
+.prog-agora {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--vermelho);
+  z-index: 3;
+}
+
+.prog-barra {
+  position: absolute;
+  top: 9px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--raio);
+  cursor: pointer;
+  overflow: hidden;
+  padding: 0 6px;
+  text-align: left;
+  z-index: 2;
+}
+
+.prog-barra span {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--branco);
+  white-space: nowrap;
+  letter-spacing: 0.03em;
+}
+
+.prog-barra.foco {
+  outline: 2px solid var(--cinza-escuro);
+  outline-offset: 1px;
+}
+
+/* o realizado é uma faixa fina sob o planejado, hachurada, para dar
+   para comparar largura sem sobrepor a informação */
+.prog-barra-real {
+  position: absolute;
+  top: 31px;
+  height: 7px;
+  z-index: 2;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--cinza-escuro) 0 2px,
+    transparent 2px 4px
+  );
+  border: 1px solid var(--cinza-escuro);
+  border-radius: 1px;
+}
+
+.prog-detalhe {
+  margin-top: 18px;
+  padding: 16px 18px;
+  background: var(--fundo-sutil);
+  border: 1px solid var(--cinza-borda);
+  border-left: 3px solid var(--azul-medio);
+  border-radius: var(--raio);
+}
+
+.prog-detalhe h3 { margin-bottom: 10px; }
+.prog-detalhe p { font-size: 13px; margin-bottom: 3px; }
+
+@media (max-width: 900px) {
+  .prog-rotulo, .prog-rotulo-vazio { width: 120px; }
+}

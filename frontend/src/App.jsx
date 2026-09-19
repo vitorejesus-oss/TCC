@@ -18,6 +18,13 @@ const MODULOS = [
     ],
   },
   {
+    id: 'planejamento',
+    nome: 'Planejamento',
+    telas: [
+      { id: 'programacao', nome: 'Programação' },
+    ],
+  },
+  {
     id: 'producao',
     nome: 'Produção',
     telas: [
@@ -446,6 +453,213 @@ function PainelManutencao({ maquinas, token, selectedMaquina, setSelectedMaquina
             setSelectedMaquina(null);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+// Data no formato YYYY-MM-DD em HORA LOCAL. toISOString() devolveria a data em
+// UTC, que depois das 21h (UTC-3) já é o dia seguinte.
+function dataLocal(d = new Date()) {
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// Fase 3 - Timeline da oficina. Fica NO NÍVEL DO MÓDULO (junto de
+// ModalVerMais e PainelManutencao), não dentro de SistemaAutomacao: ele tem
+// estado próprio (data, barra em foco) e seria remontado a cada poll de 10s.
+function PainelProgramacao() {
+  const [dados, setDados] = useState(null);
+  const [data, setData] = useState(() => dataLocal());
+  const [carregando, setCarregando] = useState(true);
+  const [erroProg, setErroProg] = useState(null);
+  const [foco, setFoco] = useState(null);
+
+  useEffect(() => {
+    setCarregando(true);
+    setErroProg(null);
+    fetch(`${API_URL}/programacao?data=${data}`)
+      .then(async (r) => {
+        const json = await r.json();
+        if (!r.ok) throw new Error(json.erro || 'Erro ao carregar programação');
+        setDados(json);
+      })
+      .catch((e) => setErroProg(e.message))
+      .finally(() => setCarregando(false));
+  }, [data]);
+
+  function mudarDia(dias) {
+    const d = new Date(data + 'T12:00:00');
+    d.setDate(d.getDate() + dias);
+    setData(dataLocal(d));
+  }
+
+  const corStatus = {
+    PLANEJADO: 'var(--cinza-borda)',
+    LIBERADO: 'var(--amarelo)',
+    EXECUTANDO: 'var(--azul-medio)',
+    CONCLUIDO: 'var(--verde)',
+  };
+
+  return (
+    <div className="painel">
+      <div className="prog-topo">
+        <div>
+          <h2 style={{ marginBottom: 4 }}>Programação da oficina</h2>
+          <p className="prog-sub">
+            {dados
+              ? `${dados.total_operacoes} operação(ões) entre ${dados.janela_inicio} e ${dados.janela_fim}`
+              : 'Carregando...'}
+          </p>
+        </div>
+
+        <div className="prog-nav">
+          <button type="button" className="btn-pequeno" onClick={() => mudarDia(-1)}>
+            ← Dia anterior
+          </button>
+          <input
+            type="date"
+            value={data}
+            onChange={(e) => setData(e.target.value)}
+            aria-label="Data da programação"
+          />
+          <button type="button" className="btn-pequeno" onClick={() => mudarDia(1)}>
+            Próximo dia →
+          </button>
+        </div>
+      </div>
+
+      {erroProg && <div className="aviso">{erroProg}</div>}
+
+      {dados && dados.conflitos.length > 0 && (
+        <div className="aviso" style={{ marginTop: 0, marginBottom: 16 }}>
+          <strong>
+            {dados.conflitos.length} conflito(s) de programação
+          </strong>
+          <ul style={{ listStyle: 'none', marginTop: 8, fontSize: 13 }}>
+            {dados.conflitos.map((c, i) => (
+              <li key={i} style={{ padding: '3px 0' }}>
+                {c.maquina_nome}: {c.os_a} e {c.os_b} se sobrepõem em{' '}
+                {c.sobreposicao_min} min
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {carregando && <p>Carregando programação...</p>}
+
+      {dados && !carregando && (
+        <>
+          <div className="prog-legenda">
+            <span><i style={{ background: corStatus.PLANEJADO }} /> Planejado</span>
+            <span><i style={{ background: corStatus.LIBERADO }} /> Liberado</span>
+            <span><i style={{ background: corStatus.EXECUTANDO }} /> Executando</span>
+            <span><i style={{ background: corStatus.CONCLUIDO }} /> Concluído</span>
+            <span><i className="prog-hachura" /> Realizado</span>
+          </div>
+
+          <div className="prog-wrapper">
+            <div className="prog-eixo">
+              <div className="prog-rotulo-vazio" />
+              <div className="prog-marcas">
+                {dados.marcas.map((m, i) => (
+                  <span key={i} style={{ left: `${m.esquerda_pct}%` }}>
+                    {m.hora}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {dados.maquinas.map((maq) => (
+              <div key={maq.id} className="prog-linha">
+                <div className={`prog-rotulo ${maq.parada ? 'parada' : ''}`}>
+                  <strong>{maq.nome}</strong>
+                  <small>{maq.parada ? 'PARADA' : maq.localizacao || '-'}</small>
+                </div>
+
+                <div className="prog-faixa">
+                  {dados.marcas.map((m, i) => (
+                    <div
+                      key={i}
+                      className="prog-grade"
+                      style={{ left: `${m.esquerda_pct}%` }}
+                    />
+                  ))}
+
+                  {dados.agora_pct !== null && (
+                    <div
+                      className="prog-agora"
+                      style={{ left: `${dados.agora_pct}%` }}
+                      title="agora"
+                    />
+                  )}
+
+                  {maq.barras.map((b) => (
+                    <React.Fragment key={b.alocacao_id}>
+                      {b.planejado && (
+                        <button
+                          type="button"
+                          className={`prog-barra ${foco === b.alocacao_id ? 'foco' : ''}`}
+                          style={{
+                            left: `${b.planejado.esquerda_pct}%`,
+                            width: `${b.planejado.largura_pct}%`,
+                            background: corStatus[b.status] || 'var(--cinza-borda)',
+                          }}
+                          onClick={() =>
+                            setFoco(foco === b.alocacao_id ? null : b.alocacao_id)
+                          }
+                          title={`${b.os_numero} · OP ${b.sequencia} · ${b.planejado.inicio}–${b.planejado.fim}`}
+                        >
+                          <span>{b.os_numero}</span>
+                        </button>
+                      )}
+
+                      {b.realizado && (
+                        <div
+                          className="prog-barra-real"
+                          style={{
+                            left: `${b.realizado.esquerda_pct}%`,
+                            width: `${b.realizado.largura_pct}%`,
+                          }}
+                          title={`realizado ${b.realizado.inicio}–${b.realizado.fim}`}
+                        />
+                      )}
+                    </React.Fragment>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {foco && (() => {
+            const b = dados.maquinas
+              .flatMap((m) => m.barras)
+              .find((x) => x.alocacao_id === foco);
+            if (!b) return null;
+            return (
+              <div className="prog-detalhe">
+                <h3>{b.os_numero} — operação {b.sequencia}</h3>
+                <p><strong>Peça:</strong> {b.peca_nome || b.peca_codigo}</p>
+                <p><strong>Status:</strong> {b.status}</p>
+                <p>
+                  <strong>Planejado:</strong>{' '}
+                  {b.planejado
+                    ? `${b.planejado.inicio}–${b.planejado.fim} (${b.planejado.minutos} min)`
+                    : '—'}
+                </p>
+                <p>
+                  <strong>Realizado:</strong>{' '}
+                  {b.realizado
+                    ? `${b.realizado.inicio}–${b.realizado.fim} (${b.tempo_realizado_min ?? '—'} min)`
+                    : '— ainda não medido'}
+                </p>
+                <p><strong>Operador:</strong> {b.operador || '—'}</p>
+              </div>
+            );
+          })()}
+        </>
       )}
     </div>
   );
@@ -1278,6 +1492,7 @@ export default function SistemaAutomacao() {
       {tab === 'relatorio' && <PainelRelatorio />}
       {tab === 'backup' && <PainelBackup />}
       {tab === 'estatisticas' && <PainelEstatisticas />}
+      {tab === 'programacao' && <PainelProgramacao />}
       {tab === 'login' && <PainelLogin />}
       {tab === 'manutencao' && (
         <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>

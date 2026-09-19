@@ -1405,6 +1405,213 @@ def get_operacoes_os(os_id):
     return jsonify(operacoes)
 
 
+def _parse_ts(valor):
+    """Lê um timestamp do banco aceitando os dois formatos que existem lá.
+
+    Registros novos gravam '2026-09-19T12:56:36' (isoformat).
+    Registros antigos, de antes da Fase 1, gravam '2026-09-15 23:54:12'
+    (CURRENT_TIMESTAMP do SQLite). Os dois precisam funcionar enquanto
+    houver histórico anterior à migração.
+    """
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace(' ', 'T'))
+    except (ValueError, TypeError):
+        return None
+
+
+@app.route('/api/programacao', methods=['GET'])
+def get_programacao():
+    """Programação da oficina num dia, máquina por máquina.
+
+    Query string:
+        data=YYYY-MM-DD  (padrão: hoje)
+
+    Devolve, para cada máquina, as operações alocadas naquele dia, com a
+    posição de cada barra já calculada em porcentagem da janela. O
+    frontend só desenha — não faz conta de horário.
+    """
+    data_str = request.args.get('data') or datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        dia = datetime.strptime(data_str, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'erro': 'Data inválida. Use YYYY-MM-DD'}), 400
+
+    dia_inicio = dia.replace(hour=0, minute=0, second=0, microsecond=0)
+    dia_fim = dia_inicio + timedelta(days=1)
+
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute('''SELECT m.id, m.nome, m.status, m.localizacao, m.quebrada_em
+                 FROM maquinas m
+                 ORDER BY m.id''')
+    maquinas_rows = c.fetchall()
+
+    c.execute('''SELECT am.id, am.maquina_id, am.sequencia, am.status,
+                        am.inicio_planejado, am.fim_planejado,
+                        am.inicio_real, am.fim_real,
+                        am.tempo_realizado_min, am.operador,
+                        os.id AS os_id, os.numero AS os_numero,
+                        os.prioridade,
+                        n.peca_codigo, p.nome AS peca_nome
+                 FROM alocacao_maquinas am
+                 JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                 JOIN notas n ON n.id = os.nota_id
+                 LEFT JOIN pecas p ON p.codigo = n.peca_codigo
+                 ORDER BY am.maquina_id, am.inicio_planejado''')
+    todas = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    # Fica só o que encosta no dia pedido, pelo planejado ou pelo realizado.
+    def toca_o_dia(a):
+        for campo_ini, campo_fim in (('inicio_planejado', 'fim_planejado'),
+                                     ('inicio_real', 'fim_real')):
+            ini = _parse_ts(a[campo_ini])
+            fim = _parse_ts(a[campo_fim]) or ini
+            if ini and fim and ini < dia_fim and fim >= dia_inicio:
+                return True
+        return False
+
+    do_dia = [a for a in todas if toca_o_dia(a)]
+
+    # Janela do eixo: do primeiro início ao último fim, arredondado para a
+    # hora cheia, com no mínimo 8h para a barra não ficar espremida.
+    marcos = []
+    for a in do_dia:
+        for campo in ('inicio_planejado', 'fim_planejado', 'inicio_real', 'fim_real'):
+            ts = _parse_ts(a[campo])
+            if ts:
+                marcos.append(ts)
+
+    if marcos:
+        janela_ini = min(marcos).replace(minute=0, second=0, microsecond=0)
+        janela_fim = max(marcos).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        janela_ini = dia_inicio.replace(hour=7)
+        janela_fim = dia_inicio.replace(hour=17)
+
+    if (janela_fim - janela_ini) < timedelta(hours=8):
+        janela_fim = janela_ini + timedelta(hours=8)
+
+    total_min = max(int((janela_fim - janela_ini).total_seconds() / 60), 1)
+
+    def faixa(ini_str, fim_str):
+        """Converte um par de timestamps em posição e largura, em %."""
+        ini = _parse_ts(ini_str)
+        fim = _parse_ts(fim_str)
+        if not ini:
+            return None
+        if not fim:
+            fim = ini + timedelta(minutes=1)
+        ini_rec = max(ini, janela_ini)
+        fim_rec = min(fim, janela_fim)
+        if fim_rec <= ini_rec:
+            return None
+        esquerda = (ini_rec - janela_ini).total_seconds() / 60 / total_min * 100
+        largura = (fim_rec - ini_rec).total_seconds() / 60 / total_min * 100
+        return {
+            'esquerda_pct': round(esquerda, 3),
+            'largura_pct': round(max(largura, 0.6), 3),  # piso para não sumir
+            'inicio': ini.strftime('%H:%M'),
+            'fim': fim.strftime('%H:%M'),
+            'minutos': int((fim - ini).total_seconds() / 60),
+        }
+
+    por_maquina = {}
+    for a in do_dia:
+        por_maquina.setdefault(a['maquina_id'], []).append(a)
+
+    conflitos = []
+    maquinas = []
+
+    for m in maquinas_rows:
+        alocs = por_maquina.get(m['id'], [])
+        barras = []
+
+        for a in alocs:
+            planejado = faixa(a['inicio_planejado'], a['fim_planejado'])
+            realizado = faixa(a['inicio_real'], a['fim_real'] or a['inicio_real'])
+
+            barras.append({
+                'alocacao_id': a['id'],
+                'os_id': a['os_id'],
+                'os_numero': a['os_numero'],
+                'sequencia': a['sequencia'],
+                'status': a['status'],
+                'prioridade': a['prioridade'],
+                'peca_codigo': a['peca_codigo'],
+                'peca_nome': a['peca_nome'],
+                'operador': a['operador'],
+                'planejado': planejado,
+                'realizado': realizado,
+                'tempo_realizado_min': a['tempo_realizado_min'],
+            })
+
+        # Conflito: duas operações planejadas na mesma máquina com horário
+        # sobreposto. É o que o coordenador não enxerga numa tabela.
+        for i in range(len(alocs)):
+            for j in range(i + 1, len(alocs)):
+                a1, a2 = alocs[i], alocs[j]
+                i1, f1 = _parse_ts(a1['inicio_planejado']), _parse_ts(a1['fim_planejado'])
+                i2, f2 = _parse_ts(a2['inicio_planejado']), _parse_ts(a2['fim_planejado'])
+                if not (i1 and f1 and i2 and f2):
+                    continue
+                if i1 < f2 and i2 < f1:
+                    sobreposicao = int(
+                        (min(f1, f2) - max(i1, i2)).total_seconds() / 60
+                    )
+                    conflitos.append({
+                        'maquina_id': m['id'],
+                        'maquina_nome': m['nome'],
+                        'os_a': a1['os_numero'],
+                        'os_b': a2['os_numero'],
+                        'sobreposicao_min': sobreposicao,
+                    })
+
+        maquinas.append({
+            'id': m['id'],
+            'nome': m['nome'],
+            'status': m['status'],
+            'localizacao': m['localizacao'],
+            'parada': m['status'] == 'QUEBRADA',
+            'barras': barras,
+        })
+
+    # Marcas de hora do eixo
+    marcas = []
+    cursor = janela_ini
+    while cursor <= janela_fim:
+        marcas.append({
+            'hora': cursor.strftime('%H:%M'),
+            'esquerda_pct': round(
+                (cursor - janela_ini).total_seconds() / 60 / total_min * 100, 3
+            ),
+        })
+        cursor += timedelta(hours=1)
+
+    # Linha do "agora", só se o dia pedido for hoje
+    agora = datetime.now()
+    agora_pct = None
+    if janela_ini <= agora <= janela_fim:
+        agora_pct = round(
+            (agora - janela_ini).total_seconds() / 60 / total_min * 100, 3
+        )
+
+    return jsonify({
+        'data': data_str,
+        'janela_inicio': janela_ini.strftime('%H:%M'),
+        'janela_fim': janela_fim.strftime('%H:%M'),
+        'marcas': marcas,
+        'agora_pct': agora_pct,
+        'maquinas': maquinas,
+        'conflitos': conflitos,
+        'total_operacoes': len(do_dia),
+    })
+
+
 @app.route('/api/alocacoes/<int:alocacao_id>/iniciar', methods=['POST'])
 @jwt_required()
 def iniciar_alocacao(alocacao_id):
