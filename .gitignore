@@ -7,3 +7,5 @@ usinagem.db
 backups/
 logs/
 *.egg-info/
+*.db.bak
+_fases/

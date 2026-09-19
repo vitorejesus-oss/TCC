@@ -1099,10 +1099,16 @@ export default function SistemaAutomacao() {
         <h3>Desempenho por máquina</h3>
         <div className="tabela-wrapper" style={{ marginBottom: 24 }}>
           <table>
-            <thead><tr><th>Máquina</th><th>Operações</th><th>Tempo médio (min)</th></tr></thead>
+            <thead><tr><th>Máquina</th><th>Operações</th><th>Tempo planejado (min)</th><th>Tempo realizado (min)</th><th>Operações medidas</th></tr></thead>
             <tbody>
               {estatisticas.desempenho_por_maquina.map((m, i) => (
-                <tr key={i}><td>{m.maquina}</td><td>{m.operacoes}</td><td>{m.tempo_medio_min}</td></tr>
+                <tr key={i}>
+                  <td>{m.maquina}</td>
+                  <td>{m.operacoes}</td>
+                  <td>{m.tempo_planejado_medio_min ?? '—'}</td>
+                  <td>{m.tempo_realizado_medio_min ?? '—'}</td>
+                  <td>{m.operacoes_medidas}</td>
+                </tr>
               ))}
             </tbody>
           </table>
