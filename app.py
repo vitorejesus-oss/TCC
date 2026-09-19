@@ -71,6 +71,8 @@ TEMPO_MANUAL_MIN = int(os.getenv('TEMPO_MANUAL_MIN', '45'))
 TEMPO_AUTOMATICO_MIN = int(os.getenv('TEMPO_AUTOMATICO_MIN', '3'))
 CUSTO_HORA_PRODUCAO = float(os.getenv('CUSTO_HORA_PRODUCAO', '45.0'))
 CUSTO_MEDIO_RETRABALHO = float(os.getenv('CUSTO_MEDIO_RETRABALHO', '120.0'))
+# Tempo até uma máquina QUEBRADA voltar, contado a partir de agora ao planejar nela
+FOLGA_MAQUINA_PARADA_MIN = int(os.getenv('FOLGA_MAQUINA_PARADA_MIN', '60'))
 SENHA_PADRAO_DEMO = os.getenv('SENHA_PADRAO_DEMO', 'Vitor367')
 
 # Diferencial #11 - Notificação de nota criada no Telegram (com desenho técnico)
@@ -846,6 +848,41 @@ class GeradorRelatorio:
 # LÓGICA DE AUTOMAÇÃO
 # ============================================================================
 
+def _fim_da_fila(cursor, maquina_id, agora):
+    """Quando a máquina fica livre, pelo que já está planejado nela.
+
+    É o maior fim_planejado FUTURO entre as operações dela que ainda não foram
+    concluídas; se não há nenhuma, a máquina está livre `agora`. Operação
+    CONCLUIDO não ocupa mais a máquina, mesmo que o fim planejado seja futuro.
+    Os timestamps são lidos em Python (_parse_ts) para não depender da
+    comparação de texto entre formatos diferentes.
+    """
+    cursor.execute('''SELECT fim_planejado FROM alocacao_maquinas
+                      WHERE maquina_id = ? AND status != 'CONCLUIDO' ''', (maquina_id,))
+    fins = [f for f in (_parse_ts(r[0]) for r in cursor.fetchall()) if f and f > agora]
+    return max(fins) if fins else agora
+
+
+def _proximo_numero(cursor, tabela, prefixo):
+    """Próximo número sequencial do ano no formato PREFIXO-AAAA-NNNN.
+
+    Só olha números já no formato novo do ano corrente (os antigos, como
+    OS-20260919124204794201, não casam com o padrão e não são tocados).
+    CHAMAR DENTRO DE UMA TRANSAÇÃO COM LOCK DE ESCRITA (BEGIN IMMEDIATE), e
+    gravar o número na mesma transação: é isso que impede dois pedidos
+    simultâneos de calcularem o mesmo. A restrição UNIQUE de `numero` é a
+    segunda barreira.
+    """
+    if tabela not in ('ordens_servico', 'notas'):
+        raise ValueError(f'tabela inválida para numeração: {tabela}')
+    base = f'{prefixo}-{datetime.now().year}-'
+    cursor.execute(
+        f'SELECT MAX(CAST(SUBSTR(numero, ?) AS INTEGER)) FROM {tabela} WHERE numero LIKE ?',
+        (len(base) + 1, base + '%'))
+    ultimo = cursor.fetchone()[0] or 0
+    return f'{base}{ultimo + 1:04d}'
+
+
 class AutomacaoUsinagem:
     """Lógica principal de automação"""
 
@@ -856,6 +893,11 @@ class AutomacaoUsinagem:
         c = conn.cursor()
 
         try:
+            # Lock de escrita já no início: ler a fila das máquinas e gravar as
+            # alocações precisa ser uma etapa só, senão dois pedidos simultâneos
+            # leem a mesma fila e planejam sobrepostos.
+            c.execute('BEGIN IMMEDIATE')
+
             c.execute('SELECT * FROM notas WHERE id = ?', (nota_id,))
             nota = c.fetchone()
 
@@ -896,7 +938,7 @@ class AutomacaoUsinagem:
                     'descricao': op['descricao']
                 })
 
-            numero_os = f"OS-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            numero_os = _proximo_numero(c, 'ordens_servico', 'OS')
             prioridade = 'URGENTE' if nota['prioridade'] == 'URGENTE' else 'NORMAL'
 
             c.execute('''INSERT INTO ordens_servico
@@ -907,18 +949,34 @@ class AutomacaoUsinagem:
 
             os_id = c.lastrowid
 
-            tempo_inicio = datetime.now()
+            agora = datetime.now()
+            fim_operacao_anterior = agora
             alocacoes_em_maquina_parada = []
             for op in operacoes:
                 c.execute('SELECT id, status FROM maquinas WHERE nome = ?', (op['maquina'],))
                 maquina = c.fetchone()
 
-                # Planejar para máquina parada é permitido (ela pode voltar),
-                # mas fica registrado na auditoria depois do commit.
-                if maquina['status'] == 'QUEBRADA':
-                    alocacoes_em_maquina_parada.append((op['sequencia'], op['maquina']))
+                # Começa depois da fila da máquina e nunca antes do fim da
+                # operação anterior da mesma OS. A duração continua sendo a de
+                # operacoes.tempo_estimado.
+                fim_fila = _fim_da_fila(c, maquina['id'], agora)
 
+                # Máquina parada: o roteiro da peça define a máquina, então não
+                # se troca de máquina. A folga é o tempo até ela voltar, um
+                # evento único contado a partir de AGORA (não se soma à fila
+                # a cada OS): a máquina só fica disponível em agora + folga, e
+                # dali em diante a fila corre normal. O fato fica na auditoria
+                # (gravada depois do commit).
+                disponivel_em = agora
+                if maquina['status'] == 'QUEBRADA':
+                    disponivel_em = agora + timedelta(minutes=FOLGA_MAQUINA_PARADA_MIN)
+
+                tempo_inicio = max(fim_operacao_anterior, fim_fila, disponivel_em)
                 tempo_fim = tempo_inicio + timedelta(minutes=op['tempo_estimado'])
+
+                if maquina['status'] == 'QUEBRADA':
+                    alocacoes_em_maquina_parada.append(
+                        (op['sequencia'], op['maquina'], tempo_inicio))
 
                 c.execute('''INSERT INTO alocacao_maquinas
                             (ordem_servico_id, maquina_id, sequencia, status,
@@ -927,7 +985,7 @@ class AutomacaoUsinagem:
                          (os_id, maquina[0], op['sequencia'], 'PLANEJADO',
                           tempo_inicio.isoformat(), tempo_fim.isoformat()))
 
-                tempo_inicio = tempo_fim
+                fim_operacao_anterior = tempo_fim
 
             c.execute('''UPDATE notas SET status = ?, validada_em = ?
                         WHERE id = ?''',
@@ -938,11 +996,12 @@ class AutomacaoUsinagem:
             registrar_auditoria('PROCESSAMENTO', 'NOTA', nota_id,
                               f'Nota processada automaticamente. OS: {numero_os}')
 
-            for sequencia, nome_maquina in alocacoes_em_maquina_parada:
+            for sequencia, nome_maquina, inicio_deslocado in alocacoes_em_maquina_parada:
                 registrar_auditoria(
                     'ALOCACAO_EM_MAQUINA_PARADA', 'ORDEM_SERVICO', os_id,
                     f'{numero_os}: operação {sequencia} planejada na máquina '
-                    f'{nome_maquina}, que está QUEBRADA'
+                    f'{nome_maquina}, que está QUEBRADA; início deslocado para '
+                    f'{inicio_deslocado.strftime("%d/%m %H:%M")}'
                 )
 
             MonitorTempoReal.notificar_nota_processada({
@@ -1236,7 +1295,10 @@ def criar_nota():
     c = conn.cursor()
 
     try:
-        numero = f"NOT-{datetime.now().strftime('%Y%m%d%H%M')}-{int(datetime.now().microsecond/1000)}"
+        # Lock de escrita antes de calcular o número: o cálculo e o INSERT
+        # viram uma etapa só, e dois pedidos simultâneos não pegam o mesmo.
+        c.execute('BEGIN IMMEDIATE')
+        numero = _proximo_numero(c, 'notas', 'NT')
 
         c.execute('''INSERT INTO notas
                     (numero, peca_codigo, quantidade, prioridade, solicitante, status, criada_em)
