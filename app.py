@@ -289,6 +289,15 @@ def init_db():
         if coluna not in colunas_relatorio:
             c.execute(f'ALTER TABLE relatorios_manutencao ADD COLUMN {coluna} {tipo_sql}')
 
+    # --- Origem do dado: 'REAL' (medido no chão de fábrica) ou 'DEMONSTRACAO'
+    # (gerado por seed_demo.py). Fica em notas e em relatorios_manutencao, as
+    # duas tabelas que nascem do registro humano. OS e alocações herdam a
+    # origem pela nota. Linhas anteriores a esta coluna leem 'REAL'.
+    for tabela in ('notas', 'relatorios_manutencao'):
+        c.execute(f"PRAGMA table_info({tabela})")
+        if 'origem' not in {row[1] for row in c.fetchall()}:
+            c.execute(f"ALTER TABLE {tabela} ADD COLUMN origem TEXT DEFAULT 'REAL'")
+
     # Tabela de CHAT DE MANUTENÇÃO (Feature 4)
     c.execute('''CREATE TABLE IF NOT EXISTS chat_manutencao (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -513,38 +522,93 @@ class Validador:
 # ECONOMIA / MÉTRICAS (usado pelo relatório em PDF e pelo dashboard)
 # ============================================================================
 
-def calcular_economia(mes_nome, ano):
+ORIGENS_VALIDAS = ('REAL', 'DEMONSTRACAO', 'TODAS')
+
+
+def _origem_da_requisicao():
+    """Lê ?origem=REAL|DEMONSTRACAO|TODAS (padrão TODAS).
+
+    Devolve (origem, None) ou (None, resposta_400) para o endpoint repassar.
+    """
+    origem = (request.args.get('origem') or 'TODAS').strip().upper()
+    if origem not in ORIGENS_VALIDAS:
+        return None, (jsonify({'erro': 'origem inválida. Use REAL, DEMONSTRACAO ou TODAS'}), 400)
+    return origem, None
+
+
+def _sql_origem(origem, coluna):
+    """Fragmento SQL e parâmetros que filtram `coluna` pela origem.
+
+    'DEMONSTRACAO' é a marca explícita; REAL é todo o resto (inclusive NULL,
+    de linhas anteriores à coluna).
+    """
+    if origem == 'DEMONSTRACAO':
+        return f"COALESCE({coluna}, 'REAL') = 'DEMONSTRACAO'", ()
+    if origem == 'REAL':
+        return f"COALESCE({coluna}, 'REAL') != 'DEMONSTRACAO'", ()
+    return '1 = 1', ()
+
+
+def _contar_origens(cursor, tabela, origem):
+    """{'real': N, 'demonstracao': M}: registros de `tabela` que passam no
+    filtro, ou seja, os que de fato entram no cálculo."""
+    if tabela not in ('notas', 'relatorios_manutencao'):
+        raise ValueError(f'tabela sem coluna origem: {tabela}')
+    filtro, params = _sql_origem(origem, 'origem')
+    cursor.execute(f'''SELECT COALESCE(origem, 'REAL') = 'DEMONSTRACAO' AS demo, COUNT(*) AS n
+                       FROM {tabela} WHERE {filtro} GROUP BY demo''', params)
+    contagem = {bool(r['demo']): r['n'] for r in cursor.fetchall()}
+    return {'real': contagem.get(False, 0), 'demonstracao': contagem.get(True, 0)}
+
+
+def _origem_das_notas(alocacoes):
+    """Mesmo bloco de _contar_origens, para linhas já em memória (dicts com
+    nota_id e nota_origem): conta notas distintas, não operações."""
+    notas = {a['nota_id']: (a['nota_origem'] or 'REAL') == 'DEMONSTRACAO' for a in alocacoes}
+    demo = sum(notas.values())
+    return {'real': len(notas) - demo, 'demonstracao': demo}
+
+
+def calcular_economia(mes_nome, ano, origem='TODAS'):
     """Calcula a economia real gerada pela automação, a partir do banco"""
     numero_mes = MESES_PT_INV.get((mes_nome or '').lower())
+    filtro, params_origem = _sql_origem(origem, 'origem')
 
     conn = get_db()
     c = conn.cursor()
 
     if numero_mes:
-        c.execute('''SELECT COUNT(*) as total FROM notas
+        c.execute(f'''SELECT COUNT(*) as total FROM notas
                      WHERE status='PROCESSADA' AND strftime('%Y', criada_em) = ?
-                       AND strftime('%m', criada_em) = ?''',
-                 (str(ano), f'{numero_mes:02d}'))
+                       AND strftime('%m', criada_em) = ? AND {filtro}''',
+                 (str(ano), f'{numero_mes:02d}') + params_origem)
     else:
-        c.execute('''SELECT COUNT(*) as total FROM notas
-                     WHERE status='PROCESSADA' AND strftime('%Y', criada_em) = ?''',
-                 (str(ano),))
+        c.execute(f'''SELECT COUNT(*) as total FROM notas
+                     WHERE status='PROCESSADA' AND strftime('%Y', criada_em) = ?
+                       AND {filtro}''',
+                 (str(ano),) + params_origem)
     notas_mes = c.fetchone()['total']
 
-    c.execute('''SELECT COUNT(*) as total FROM notas
-                 WHERE status='PROCESSADA' AND strftime('%Y', criada_em) = ?''', (str(ano),))
+    c.execute(f'''SELECT COUNT(*) as total FROM notas
+                 WHERE status='PROCESSADA' AND strftime('%Y', criada_em) = ?
+                   AND {filtro}''', (str(ano),) + params_origem)
     notas_ano = c.fetchone()['total']
 
-    if numero_mes:
+    # Erros evitados vêm da auditoria, que não guarda origem: o gerador de
+    # demonstração nunca escreve nela, então todo evento ali é real.
+    if origem == 'DEMONSTRACAO':
+        erros_evitados = 0
+    elif numero_mes:
         c.execute('''SELECT COUNT(*) as total FROM auditoria
                      WHERE tipo_evento='VALIDACAO_ERRO' AND strftime('%Y', criado_em) = ?
                        AND strftime('%m', criado_em) = ?''',
                  (str(ano), f'{numero_mes:02d}'))
+        erros_evitados = c.fetchone()['total']
     else:
         c.execute('''SELECT COUNT(*) as total FROM auditoria
                      WHERE tipo_evento='VALIDACAO_ERRO' AND strftime('%Y', criado_em) = ?''',
                  (str(ano),))
-    erros_evitados = c.fetchone()['total']
+        erros_evitados = c.fetchone()['total']
 
     conn.close()
 
@@ -1518,6 +1582,7 @@ def get_programacao():
                         am.tempo_realizado_min, am.operador,
                         os.id AS os_id, os.numero AS os_numero,
                         os.prioridade,
+                        n.id AS nota_id, n.origem AS nota_origem,
                         n.peca_codigo, p.nome AS peca_nome
                  FROM alocacao_maquinas am
                  JOIN ordens_servico os ON os.id = am.ordem_servico_id
@@ -1671,6 +1736,9 @@ def get_programacao():
         'maquinas': maquinas,
         'conflitos': conflitos,
         'total_operacoes': len(do_dia),
+        # Notas por trás das operações mostradas neste dia. Não há filtro
+        # aqui: a tela mostra tudo e só avisa quando há demonstração.
+        'origem_dados': _origem_das_notas(do_dia),
     })
 
 
@@ -2025,25 +2093,39 @@ def enviar_chat_manutencao():
 
 @app.route('/api/metricas', methods=['GET'])
 def get_metricas():
-    """Retorna métricas do sistema, calculadas em tempo real a partir do banco"""
+    """Retorna métricas do sistema, calculadas em tempo real a partir do banco.
+
+    Query string:
+        origem=REAL|DEMONSTRACAO|TODAS  (padrão TODAS)
+    """
+    origem, erro = _origem_da_requisicao()
+    if erro:
+        return erro
+    filtro, params = _sql_origem(origem, 'n.origem')
+
     conn = get_db()
     c = conn.cursor()
 
-    c.execute('SELECT COUNT(*) as total FROM notas')
+    c.execute(f'SELECT COUNT(*) as total FROM notas n WHERE {filtro}', params)
     total_notas = c.fetchone()['total']
 
-    c.execute('SELECT COUNT(*) as total FROM ordens_servico WHERE status = "CONCLUIDA"')
+    c.execute(f'''SELECT COUNT(*) as total FROM ordens_servico os
+                  JOIN notas n ON n.id = os.nota_id
+                  WHERE os.status = 'CONCLUIDA' AND {filtro}''', params)
     os_concluidas = c.fetchone()['total']
 
-    c.execute('SELECT COUNT(*) as total FROM ordens_servico')
+    c.execute(f'''SELECT COUNT(*) as total FROM ordens_servico os
+                  JOIN notas n ON n.id = os.nota_id WHERE {filtro}''', params)
     os_total = c.fetchone()['total']
+
+    origem_dados = _contar_origens(c, 'notas', origem)
 
     conn.close()
 
     taxa_aderencia = round((os_concluidas / os_total) * 100, 1) if os_total else 0.0
 
     agora = datetime.now()
-    economia = calcular_economia(MESES_PT[agora.month], agora.year)
+    economia = calcular_economia(MESES_PT[agora.month], agora.year, origem)
 
     return jsonify({
         'total_notas': total_notas,
@@ -2051,6 +2133,7 @@ def get_metricas():
         'taxa_aderencia': taxa_aderencia,
         'economia_mensal': economia['economia_mensal'],
         'tempo_economizado_horas': economia['tempo_economizado'],
+        'origem_dados': origem_dados,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -2238,11 +2321,20 @@ def get_logs():
 
 @app.route('/api/estatisticas', methods=['GET'])
 def get_estatisticas():
-    """Estatísticas de desempenho por máquina, por solicitante e economia semanal"""
+    """Estatísticas de desempenho por máquina, por solicitante e economia semanal.
+
+    Query string:
+        origem=REAL|DEMONSTRACAO|TODAS  (padrão TODAS)
+    """
+    origem, erro = _origem_da_requisicao()
+    if erro:
+        return erro
+    filtro, params = _sql_origem(origem, 'n.origem')
+
     conn = get_db()
     c = conn.cursor()
 
-    c.execute('''SELECT m.nome AS maquina,
+    c.execute(f'''SELECT m.nome AS maquina,
                         COUNT(am.id) AS operacoes,
                         SUM(CASE WHEN am.fim_real IS NOT NULL THEN 1 ELSE 0 END)
                             AS operacoes_medidas,
@@ -2253,20 +2345,25 @@ def get_estatisticas():
                             AS tempo_realizado_medio_min
                  FROM alocacao_maquinas am
                  JOIN maquinas m ON m.id = am.maquina_id
+                 JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                 JOIN notas n ON n.id = os.nota_id
+                 WHERE {filtro}
                  GROUP BY m.id, m.nome
-                 ORDER BY m.nome''')
+                 ORDER BY m.nome''', params)
     desempenho_maquinas = [dict(row) for row in c.fetchall()]
 
-    c.execute('''SELECT COALESCE(solicitante, 'NAO_INFORMADO') as operador,
+    c.execute(f'''SELECT COALESCE(n.solicitante, 'NAO_INFORMADO') as operador,
                         COUNT(*) as total_notas,
-                        SUM(CASE WHEN status != 'PROCESSADA' THEN 1 ELSE 0 END) as pendentes
-                 FROM notas GROUP BY solicitante''')
+                        SUM(CASE WHEN n.status != 'PROCESSADA' THEN 1 ELSE 0 END) as pendentes
+                 FROM notas n WHERE {filtro} GROUP BY n.solicitante''', params)
     por_operador = [dict(row) for row in c.fetchall()]
 
-    c.execute('''SELECT strftime('%W', criada_em) as semana, COUNT(*) as notas
-                 FROM notas
-                 WHERE status = 'PROCESSADA' AND strftime('%Y', criada_em) = strftime('%Y', 'now')
-                 GROUP BY semana ORDER BY semana''')
+    c.execute(f'''SELECT strftime('%W', n.criada_em) as semana, COUNT(*) as notas
+                 FROM notas n
+                 WHERE n.status = 'PROCESSADA'
+                   AND strftime('%Y', n.criada_em) = strftime('%Y', 'now')
+                   AND {filtro}
+                 GROUP BY semana ORDER BY semana''', params)
     economia_semanal = []
     for row in c.fetchall():
         notas_semana = row['notas']
@@ -2277,30 +2374,45 @@ def get_estatisticas():
             'economia_estimada': valor
         })
 
+    origem_dados = _contar_origens(c, 'notas', origem)
+
     conn.close()
 
     return jsonify({
         'desempenho_por_maquina': desempenho_maquinas,
         'notas_por_operador': por_operador,
         'economia_semanal': economia_semanal,
+        'origem_dados': origem_dados,
         'gerado_em': datetime.now().isoformat()
     })
 
 @app.route('/api/indicadores/manutencao', methods=['GET'])
 def indicadores_manutencao():
-    """MTTR por máquina, a partir das intervenções com duração medida."""
+    """MTTR por máquina, a partir das intervenções com duração medida.
+
+    Query string:
+        origem=REAL|DEMONSTRACAO|TODAS  (padrão TODAS)
+
+    O filtro fica no ON do LEFT JOIN: toda máquina continua listada, só as
+    intervenções contadas mudam.
+    """
+    origem, erro = _origem_da_requisicao()
+    if erro:
+        return erro
+    filtro, params = _sql_origem(origem, 'r.origem')
+
     conn = get_db()
     c = conn.cursor()
 
-    c.execute('''SELECT m.id, m.nome, m.status, m.quebrada_em,
+    c.execute(f'''SELECT m.id, m.nome, m.status, m.quebrada_em,
                         COUNT(r.id) AS intervencoes,
                         SUM(CASE WHEN r.tempo_reparo_min IS NOT NULL THEN 1 ELSE 0 END)
                             AS intervencoes_medidas,
                         ROUND(AVG(r.tempo_reparo_min), 1) AS mttr_min
                  FROM maquinas m
-                 LEFT JOIN relatorios_manutencao r ON r.maquina_id = m.id
+                 LEFT JOIN relatorios_manutencao r ON r.maquina_id = m.id AND {filtro}
                  GROUP BY m.id, m.nome, m.status, m.quebrada_em
-                 ORDER BY m.nome''')
+                 ORDER BY m.nome''', params)
 
     agora = datetime.now()
     resultado = []
@@ -2323,12 +2435,15 @@ def indicadores_manutencao():
     total = len(resultado)
     paradas = sum(1 for m in resultado if m['status'] == 'QUEBRADA')
 
+    origem_dados = _contar_origens(c, 'relatorios_manutencao', origem)
+
     conn.close()
     return jsonify({
         'maquinas': resultado,
         'total': total,
         'paradas': paradas,
         'disponibilidade_percentual': round((total - paradas) / total * 100, 1) if total else None,
+        'origem_dados': origem_dados,
     })
 
 @app.errorhandler(404)

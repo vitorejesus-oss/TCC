@@ -315,5 +315,74 @@ class TestEstatisticas:
         assert 'economia_semanal' in data
 
 
+class TestOrigemDados:
+    """Visibilidade da origem: ?origem=REAL|DEMONSTRACAO|TODAS e o bloco origem_dados"""
+
+    ROTAS = ['/api/metricas', '/api/estatisticas', '/api/indicadores/manutencao']
+
+    @staticmethod
+    def _get(client, rota, origem=None):
+        resposta = client.get(rota + (f'?origem={origem}' if origem else ''))
+        assert resposta.status_code == 200
+        return json.loads(resposta.data)
+
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_bloco_origem_dados_sempre_presente(self, client, rota):
+        data = self._get(client, rota)
+        assert set(data['origem_dados']) == {'real', 'demonstracao'}
+
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_filtros_particionam_o_total(self, client, rota):
+        todas = self._get(client, rota)['origem_dados']
+        real = self._get(client, rota, 'REAL')['origem_dados']
+        demo = self._get(client, rota, 'DEMONSTRACAO')['origem_dados']
+        assert real['demonstracao'] == 0
+        assert demo['real'] == 0
+        assert todas == {'real': real['real'], 'demonstracao': demo['demonstracao']}
+
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_origem_invalida_retorna_400(self, client, rota):
+        assert client.get(rota + '?origem=INVENTADA').status_code == 400
+
+    def test_registro_de_demonstracao_entra_na_contagem_e_o_filtro_o_separa(self, client):
+        """Insere uma nota e um relatório DEMONSTRACAO e confere que aparecem
+        (e só aparecem) onde devem, independente do que já houver no banco."""
+        from app import get_db
+
+        antes_m = self._get(client, '/api/metricas')['origem_dados']
+        antes_r = self._get(client, '/api/indicadores/manutencao')['origem_dados']
+        conn = get_db()
+        try:
+            conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status, origem)
+                            VALUES ('TESTE-ORIGEM-1', '40-091799', 1, 'PROCESSADA', 'DEMONSTRACAO')''')
+            maquina_id = conn.execute('SELECT id FROM maquinas LIMIT 1').fetchone()[0]
+            conn.execute('''INSERT INTO relatorios_manutencao
+                            (maquina_id, usuario, descricao, tempo_reparo_min, origem)
+                            VALUES (?, 'teste.demo@fabrica.com', 'teste', 30, 'DEMONSTRACAO')''',
+                         (maquina_id,))
+            conn.commit()
+
+            depois_m = self._get(client, '/api/metricas')['origem_dados']
+            depois_r = self._get(client, '/api/indicadores/manutencao')['origem_dados']
+            assert depois_m['demonstracao'] == antes_m['demonstracao'] + 1
+            assert depois_m['real'] == antes_m['real']
+            assert depois_r['demonstracao'] == antes_r['demonstracao'] + 1
+            assert depois_r['real'] == antes_r['real']
+
+            so_real = self._get(client, '/api/metricas', 'REAL')
+            so_demo = self._get(client, '/api/metricas', 'DEMONSTRACAO')
+            assert so_real['origem_dados']['demonstracao'] == 0
+            assert so_demo['total_notas'] == so_demo['origem_dados']['demonstracao'] >= 1
+        finally:
+            conn.execute("DELETE FROM notas WHERE numero = 'TESTE-ORIGEM-1'")
+            conn.execute("DELETE FROM relatorios_manutencao WHERE usuario = 'teste.demo@fabrica.com'")
+            conn.commit()
+            conn.close()
+
+    def test_programacao_traz_origem_dados(self, client):
+        data = self._get(client, '/api/programacao')
+        assert set(data['origem_dados']) == {'real', 'demonstracao'}
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])

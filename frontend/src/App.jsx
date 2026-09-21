@@ -466,6 +466,25 @@ function dataLocal(d = new Date()) {
   return `${d.getFullYear()}-${mm}-${dd}`;
 }
 
+// Avisa quando o que está na tela inclui dados gerados por seed_demo.py.
+// Não esconde nada, só identifica. Sem estado, mas fica no nível do módulo
+// como os outros componentes compartilhados: os painéis de Gestão são
+// aninhados em SistemaAutomacao e PainelProgramacao é de módulo.
+function AvisoOrigemDados({ origemDados }) {
+  if (!origemDados || !origemDados.demonstracao) return null;
+
+  const m = origemDados.demonstracao;
+  const n = origemDados.real ?? 0;
+
+  return (
+    <div className="aviso-info" role="note" style={{ marginBottom: 16 }}>
+      Estes indicadores incluem {m}{' '}
+      {m === 1 ? 'registro de demonstração, gerado' : 'registros de demonstração, gerados'} para
+      validar o sistema. {n === 1 ? '1 é registro real.' : `${n} são registros reais.`}
+    </div>
+  );
+}
+
 // Fase 3 - Timeline da oficina. Fica NO NÍVEL DO MÓDULO (junto de
 // ModalVerMais e PainelManutencao), não dentro de SistemaAutomacao: ele tem
 // estado próprio (data, barra em foco) e seria remontado a cada poll de 10s.
@@ -529,6 +548,8 @@ function PainelProgramacao() {
           </button>
         </div>
       </div>
+
+      {dados && <AvisoOrigemDados origemDados={dados.origem_dados} />}
 
       {erroProg && <div className="aviso">{erroProg}</div>}
 
@@ -1001,6 +1022,8 @@ export default function SistemaAutomacao() {
       <div className="painel">
         <h2 style={{ marginBottom: 20 }}>Métricas e Impacto</h2>
 
+        <AvisoOrigemDados origemDados={metricas.origem_dados} />
+
         <div className="cards-grid">
           <div className="card-metrica">
             <div className="metrica-icon">📊</div>
@@ -1317,6 +1340,8 @@ export default function SistemaAutomacao() {
     return (
       <div className="painel">
         <h2 style={{ marginBottom: 20 }}>Estatísticas Customizadas</h2>
+
+        <AvisoOrigemDados origemDados={estatisticas.origem_dados} />
 
         <h3>Desempenho por máquina</h3>
         <div className="tabela-wrapper" style={{ marginBottom: 24 }}>
