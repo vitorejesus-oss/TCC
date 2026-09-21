@@ -16,8 +16,8 @@ import sqlite3
 import logging
 import threading
 from io import BytesIO
-from functools import wraps
-from datetime import datetime, timedelta
+from functools import lru_cache, wraps
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -73,6 +73,14 @@ CUSTO_HORA_PRODUCAO = float(os.getenv('CUSTO_HORA_PRODUCAO', '45.0'))
 CUSTO_MEDIO_RETRABALHO = float(os.getenv('CUSTO_MEDIO_RETRABALHO', '120.0'))
 # Tempo até uma máquina QUEBRADA voltar, contado a partir de agora ao planejar nela
 FOLGA_MAQUINA_PARADA_MIN = int(os.getenv('FOLGA_MAQUINA_PARADA_MIN', '60'))
+# Expediente da oficina, de segunda a sexta. O planejador só conta minutos
+# dentro dele (ver somar_expediente).
+EXPEDIENTE_INICIO_H = int(os.getenv('EXPEDIENTE_INICIO_H', '7'))
+EXPEDIENTE_FIM_H = int(os.getenv('EXPEDIENTE_FIM_H', '17'))
+if not 0 <= EXPEDIENTE_INICIO_H < EXPEDIENTE_FIM_H <= 24:
+    raise ValueError(
+        f'Expediente inválido: EXPEDIENTE_INICIO_H={EXPEDIENTE_INICIO_H}, '
+        f'EXPEDIENTE_FIM_H={EXPEDIENTE_FIM_H} (precisa 0 <= início < fim <= 24)')
 SENHA_PADRAO_DEMO = os.getenv('SENHA_PADRAO_DEMO', 'Vitor367')
 
 # Diferencial #11 - Notificação de nota criada no Telegram (com desenho técnico)
@@ -275,6 +283,9 @@ def init_db():
         ('tempo_realizado_min', 'INTEGER'),   # medido: fim_real - inicio_real
         ('operador', 'TEXT'),                 # quem executou
         ('observacao', 'TEXT'),               # o que o operador registrou
+        # duração planejada em minutos de trabalho. fim - início não serve mais:
+        # uma operação que atravessa a noite tem fim - início > duração.
+        ('tempo_planejado_min', 'INTEGER'),
     ]:
         if coluna not in colunas_alocacao:
             c.execute(f'ALTER TABLE alocacao_maquinas ADD COLUMN {coluna} {tipo_sql}')
@@ -912,19 +923,116 @@ class GeradorRelatorio:
 # LÓGICA DE AUTOMAÇÃO
 # ============================================================================
 
+# Feriados nacionais de data fixa, como (mês, dia).
+FERIADOS_FIXOS = ((1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (12, 25))
+
+
+def _pascoa(ano):
+    """Domingo de Páscoa no calendário gregoriano (Meeus/Jones/Butcher)."""
+    a = ano % 19
+    b, c = divmod(ano, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mes, dia = divmod(h + l - 7 * m + 114, 31)
+    return date(ano, mes, dia + 1)
+
+
+@lru_cache(maxsize=None)
+def feriados_do_ano(ano):
+    """Feriados nacionais do ano: os de data fixa e os que dependem da Páscoa.
+
+    Móveis: Carnaval (segunda e terça, 48 e 47 dias antes), Sexta-feira Santa
+    (2 dias antes) e Corpus Christi (60 dias depois). Não há feriados
+    estaduais nem municipais.
+    """
+    pascoa = _pascoa(ano)
+    moveis = [pascoa + timedelta(days=n) for n in (-48, -47, -2, 60)]
+    return frozenset(date(ano, mes, dia) for mes, dia in FERIADOS_FIXOS) | frozenset(moveis)
+
+
+def eh_feriado(d):
+    """`d` pode ser date ou datetime."""
+    d = d.date() if isinstance(d, datetime) else d
+    return d in feriados_do_ano(d.year)
+
+
+def eh_dia_util(d):
+    """Segunda a sexta, exceto feriados nacionais (ver feriados_do_ano)."""
+    return d.weekday() < 5 and not eh_feriado(d)
+
+
+def abertura_do_dia(d):
+    return datetime(d.year, d.month, d.day) + timedelta(hours=EXPEDIENTE_INICIO_H)
+
+
+def fechamento_do_dia(d):
+    return datetime(d.year, d.month, d.day) + timedelta(hours=EXPEDIENTE_FIM_H)
+
+
+def proxima_abertura(d):
+    """Abertura do primeiro dia útil DEPOIS do dia `d` (um date)."""
+    d += timedelta(days=1)
+    while not eh_dia_util(d):
+        d += timedelta(days=1)
+    return abertura_do_dia(d)
+
+
+def alinhar_ao_expediente(t):
+    """Primeiro instante >= t que cai dentro do expediente.
+
+    Fora do horário, em fim de semana ou em feriado, empurra para a próxima
+    abertura.
+    O fechamento em si já é "fora": 17:00 vira 07:00 do dia útil seguinte.
+    """
+    d = t.date()
+    if not eh_dia_util(d):
+        return proxima_abertura(d)
+    if t < abertura_do_dia(d):
+        return abertura_do_dia(d)
+    if t >= fechamento_do_dia(d):
+        return proxima_abertura(d)
+    return t
+
+
+def somar_expediente(inicio, minutos):
+    """Instante em que termina uma tarefa de `minutos` que começa em `inicio`,
+    consumindo SÓ minutos de expediente.
+
+    120 min começando às 16h (fecha às 17h) terminam às 8h do dia útil
+    seguinte: 60 hoje, 60 amanhã. Se `inicio` cai fora do expediente, a
+    contagem começa na próxima abertura. Terminar exatamente no fechamento
+    termina naquele dia, não na manhã seguinte.
+    """
+    t = alinhar_ao_expediente(inicio)
+    restante = timedelta(minutes=minutos)
+    while True:
+        disponivel = fechamento_do_dia(t.date()) - t
+        if restante <= disponivel:
+            return t + restante
+        restante -= disponivel
+        t = proxima_abertura(t.date())
+
+
 def _fim_da_fila(cursor, maquina_id, agora):
     """Quando a máquina fica livre, pelo que já está planejado nela.
 
     É o maior fim_planejado FUTURO entre as operações dela que ainda não foram
-    concluídas; se não há nenhuma, a máquina está livre `agora`. Operação
-    CONCLUIDO não ocupa mais a máquina, mesmo que o fim planejado seja futuro.
-    Os timestamps são lidos em Python (_parse_ts) para não depender da
-    comparação de texto entre formatos diferentes.
+    concluídas; se não há nenhuma, a máquina está livre na abertura do
+    expediente mais próxima de `agora` (agora mesmo, se estiver aberto).
+    Operação CONCLUIDO não ocupa mais a máquina, mesmo que o fim planejado
+    seja futuro. Os fim_planejado gravados já são de expediente. Os timestamps
+    são lidos em Python (_parse_ts) para não depender da comparação de texto
+    entre formatos diferentes.
     """
     cursor.execute('''SELECT fim_planejado FROM alocacao_maquinas
                       WHERE maquina_id = ? AND status != 'CONCLUIDO' ''', (maquina_id,))
     fins = [f for f in (_parse_ts(r[0]) for r in cursor.fetchall()) if f and f > agora]
-    return max(fins) if fins else agora
+    return max(fins) if fins else alinhar_ao_expediente(agora)
 
 
 def _proximo_numero(cursor, tabela, prefixo):
@@ -1022,21 +1130,25 @@ class AutomacaoUsinagem:
 
                 # Começa depois da fila da máquina e nunca antes do fim da
                 # operação anterior da mesma OS. A duração continua sendo a de
-                # operacoes.tempo_estimado.
+                # operacoes.tempo_estimado, mas contada só em minutos de
+                # expediente: a operação que não cabe no dia continua no
+                # seguinte.
                 fim_fila = _fim_da_fila(c, maquina['id'], agora)
 
                 # Máquina parada: o roteiro da peça define a máquina, então não
                 # se troca de máquina. A folga é o tempo até ela voltar, um
                 # evento único contado a partir de AGORA (não se soma à fila
-                # a cada OS): a máquina só fica disponível em agora + folga, e
-                # dali em diante a fila corre normal. O fato fica na auditoria
-                # (gravada depois do commit).
+                # a cada OS): a máquina só fica disponível depois da folga, e
+                # dali em diante a fila corre normal. A folga também conta em
+                # minutos de expediente, como todo o resto do planejamento. O
+                # fato fica na auditoria (gravada depois do commit).
                 disponivel_em = agora
                 if maquina['status'] == 'QUEBRADA':
-                    disponivel_em = agora + timedelta(minutes=FOLGA_MAQUINA_PARADA_MIN)
+                    disponivel_em = somar_expediente(agora, FOLGA_MAQUINA_PARADA_MIN)
 
-                tempo_inicio = max(fim_operacao_anterior, fim_fila, disponivel_em)
-                tempo_fim = tempo_inicio + timedelta(minutes=op['tempo_estimado'])
+                tempo_inicio = alinhar_ao_expediente(
+                    max(fim_operacao_anterior, fim_fila, disponivel_em))
+                tempo_fim = somar_expediente(tempo_inicio, op['tempo_estimado'])
 
                 if maquina['status'] == 'QUEBRADA':
                     alocacoes_em_maquina_parada.append(
@@ -1044,10 +1156,11 @@ class AutomacaoUsinagem:
 
                 c.execute('''INSERT INTO alocacao_maquinas
                             (ordem_servico_id, maquina_id, sequencia, status,
-                             inicio_planejado, fim_planejado)
-                            VALUES (?, ?, ?, ?, ?, ?)''',
+                             inicio_planejado, fim_planejado, tempo_planejado_min)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
                          (os_id, maquina[0], op['sequencia'], 'PLANEJADO',
-                          tempo_inicio.isoformat(), tempo_fim.isoformat()))
+                          tempo_inicio.isoformat(), tempo_fim.isoformat(),
+                          op['tempo_estimado']))
 
                 fim_operacao_anterior = tempo_fim
 
@@ -1495,7 +1608,7 @@ def get_operacoes_os(os_id):
     conn = get_db()
     c = conn.cursor()
     c.execute('''SELECT am.id, am.sequencia, am.status,
-                        am.inicio_planejado, am.fim_planejado,
+                        am.inicio_planejado, am.fim_planejado, am.tempo_planejado_min,
                         am.inicio_real, am.fim_real,
                         am.tempo_realizado_min, am.operador, am.observacao,
                         m.nome AS maquina_nome, m.status AS maquina_status
@@ -1507,11 +1620,13 @@ def get_operacoes_os(os_id):
     for row in c.fetchall():
         op = dict(row)
 
-        # tempo planejado sai do intervalo planejado; o realizado só existe
-        # se a operação foi de fato concluída. Os dois campos vão separados
-        # de propósito: a tela precisa poder dizer qual é medido.
-        planejado = None
-        if op['inicio_planejado'] and op['fim_planejado']:
+        # Tempo planejado é a duração gravada no planejamento (minutos de
+        # trabalho): com expediente, fim - início inclui a noite. Só linhas
+        # anteriores à coluna caem no intervalo. O realizado só existe se a
+        # operação foi de fato concluída. Os dois campos vão separados de
+        # propósito: a tela precisa poder dizer qual é medido.
+        planejado = op['tempo_planejado_min']
+        if planejado is None and op['inicio_planejado'] and op['fim_planejado']:
             try:
                 ini = datetime.fromisoformat(op['inicio_planejado'])
                 fim = datetime.fromisoformat(op['fim_planejado'])
@@ -1555,8 +1670,8 @@ def get_programacao():
         data=YYYY-MM-DD  (padrão: hoje)
 
     Devolve, para cada máquina, as operações alocadas naquele dia, com a
-    posição de cada barra já calculada em porcentagem da janela. O
-    frontend só desenha — não faz conta de horário.
+    posição de cada barra já calculada em porcentagem da janela (o
+    expediente do dia). O frontend só desenha — não faz conta de horário.
     """
     data_str = request.args.get('data') or datetime.now().strftime('%Y-%m-%d')
 
@@ -1592,10 +1707,17 @@ def get_programacao():
     todas = [dict(r) for r in c.fetchall()]
     conn.close()
 
+    # O planejado só existe em expediente: num sábado, domingo ou feriado não
+    # há trabalho planejado, mesmo que o intervalo contínuo de uma operação
+    # que atravessa o fim de semana "cubra" o dia.
+    planejado_no_dia = eh_dia_util(dia.date())
+
     # Fica só o que encosta no dia pedido, pelo planejado ou pelo realizado.
     def toca_o_dia(a):
-        for campo_ini, campo_fim in (('inicio_planejado', 'fim_planejado'),
-                                     ('inicio_real', 'fim_real')):
+        pares = [('inicio_real', 'fim_real')]
+        if planejado_no_dia:
+            pares.insert(0, ('inicio_planejado', 'fim_planejado'))
+        for campo_ini, campo_fim in pares:
             ini = _parse_ts(a[campo_ini])
             fim = _parse_ts(a[campo_fim]) or ini
             if ini and fim and ini < dia_fim and fim >= dia_inicio:
@@ -1604,29 +1726,35 @@ def get_programacao():
 
     do_dia = [a for a in todas if toca_o_dia(a)]
 
-    # Janela do eixo: do primeiro início ao último fim, arredondado para a
-    # hora cheia, com no mínimo 8h para a barra não ficar espremida.
-    marcos = []
+    # Janela do eixo: o expediente do dia pedido. Uma operação que atravessa
+    # a noite aparece recortada em cada dia. Execução REAL fora do expediente
+    # não some da tela: o eixo se estende, só naquele dia, o bastante para
+    # mostrá-la.
+    janela_ini = abertura_do_dia(dia.date())
+    janela_fim = fechamento_do_dia(dia.date())
     for a in do_dia:
-        for campo in ('inicio_planejado', 'fim_planejado', 'inicio_real', 'fim_real'):
-            ts = _parse_ts(a[campo])
-            if ts:
-                marcos.append(ts)
-
-    if marcos:
-        janela_ini = min(marcos).replace(minute=0, second=0, microsecond=0)
-        janela_fim = max(marcos).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        janela_ini = dia_inicio.replace(hour=7)
-        janela_fim = dia_inicio.replace(hour=17)
-
-    if (janela_fim - janela_ini) < timedelta(hours=8):
-        janela_fim = janela_ini + timedelta(hours=8)
+        ini_r = _parse_ts(a['inicio_real'])
+        fim_r = _parse_ts(a['fim_real']) or ini_r
+        # A operação pode estar no dia só pelo planejado e ter sido executada
+        # em outro: essa execução não conta para o eixo deste dia.
+        if not ini_r or not (ini_r < dia_fim and fim_r >= dia_inicio):
+            continue
+        for ts in (max(ini_r, dia_inicio), min(fim_r, dia_fim)):
+            hora_cheia = ts.replace(minute=0, second=0, microsecond=0)
+            janela_ini = min(janela_ini, hora_cheia)
+            if hora_cheia < ts:
+                hora_cheia += timedelta(hours=1)
+            janela_fim = max(janela_fim, min(hora_cheia, dia_fim))
 
     total_min = max(int((janela_fim - janela_ini).total_seconds() / 60), 1)
 
     def faixa(ini_str, fim_str):
-        """Converte um par de timestamps em posição e largura, em %."""
+        """Converte um par de timestamps em posição e largura, em %.
+
+        Horário e minutos devolvidos são os do trecho visível no dia, não os
+        da operação inteira: uma barra 16h→8h mostra 16:00–17:00 num dia e
+        07:00–08:00 no outro.
+        """
         ini = _parse_ts(ini_str)
         fim = _parse_ts(fim_str)
         if not ini:
@@ -1642,9 +1770,9 @@ def get_programacao():
         return {
             'esquerda_pct': round(esquerda, 3),
             'largura_pct': round(max(largura, 0.6), 3),  # piso para não sumir
-            'inicio': ini.strftime('%H:%M'),
-            'fim': fim.strftime('%H:%M'),
-            'minutos': int((fim - ini).total_seconds() / 60),
+            'inicio': ini_rec.strftime('%H:%M'),
+            'fim': fim_rec.strftime('%H:%M'),
+            'minutos': int((fim_rec - ini_rec).total_seconds() / 60),
         }
 
     por_maquina = {}
@@ -1659,7 +1787,8 @@ def get_programacao():
         barras = []
 
         for a in alocs:
-            planejado = faixa(a['inicio_planejado'], a['fim_planejado'])
+            planejado = (faixa(a['inicio_planejado'], a['fim_planejado'])
+                         if planejado_no_dia else None)
             realizado = faixa(a['inicio_real'], a['fim_real'] or a['inicio_real'])
 
             barras.append({
@@ -2338,8 +2467,9 @@ def get_estatisticas():
                         COUNT(am.id) AS operacoes,
                         SUM(CASE WHEN am.fim_real IS NOT NULL THEN 1 ELSE 0 END)
                             AS operacoes_medidas,
-                        ROUND(AVG((julianday(am.fim_planejado)
-                                   - julianday(am.inicio_planejado)) * 24 * 60), 1)
+                        ROUND(AVG(COALESCE(am.tempo_planejado_min,
+                                  (julianday(am.fim_planejado)
+                                   - julianday(am.inicio_planejado)) * 24 * 60)), 1)
                             AS tempo_planejado_medio_min,
                         ROUND(AVG(am.tempo_realizado_min), 1)
                             AS tempo_realizado_medio_min

@@ -816,6 +816,13 @@ input::placeholder, textarea::placeholder { color: #8A97A6; }
   white-space: nowrap;
 }
 
+/* O último rótulo é o fechamento, no traço da borda direita: centrado, metade
+   dele cairia fora do eixo e seria cortada. */
+.prog-marcas span:last-child {
+  transform: translateX(-100%);
+  padding-right: 4px;
+}
+
 .prog-linha {
   border-bottom: 1px solid var(--linha-suave);
   min-height: 46px;

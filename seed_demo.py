@@ -19,18 +19,19 @@ import math
 import random
 import sys
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
-from app import FOLGA_MAQUINA_PARADA_MIN, _parse_ts, _proximo_numero, get_db
+from app import (EXPEDIENTE_FIM_H, EXPEDIENTE_INICIO_H, FOLGA_MAQUINA_PARADA_MIN,
+                 _parse_ts, _proximo_numero, abertura_do_dia, alinhar_ao_expediente,
+                 eh_dia_util, fechamento_do_dia, get_db, proxima_abertura,
+                 somar_expediente)
 
 ORIGEM = 'DEMONSTRACAO'
 
 SEMANAS = 8
-ABRE, FECHA = time(7, 0), time(17, 0)
-JORNADA_MIN = 600
-# Feriados nacionais de data fixa (mês, dia). Os móveis (Carnaval, Sexta-feira
-# Santa, Corpus Christi) não estão aqui: dependem da Páscoa.
-FERIADOS_FIXOS = {(1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (12, 25)}
+# O calendário (dias úteis, expediente, somar_expediente) é o do app, para o
+# planejado da demonstração sair da mesma regra do processar_nota.
+JORNADA_MIN = (EXPEDIENTE_FIM_H - EXPEDIENTE_INICIO_H) * 60
 
 FAIXA_MIN, FAIXA_MAX = 0.70, 1.40
 FRACAO_FORA_DA_FAIXA = 0.10
@@ -116,64 +117,23 @@ class _Recomecar(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Calendário: dias úteis, expediente 7h-17h
+# Sorteio de horários (o calendário em si vem do app)
 # ---------------------------------------------------------------------------
-
-def eh_util(d):
-    return d.weekday() < 5 and (d.month, d.day) not in FERIADOS_FIXOS
-
-
-def proximo_util(d):
-    d += timedelta(days=1)
-    while not eh_util(d):
-        d += timedelta(days=1)
-    return d
-
-
-def abre(d):
-    return datetime.combine(d, ABRE)
-
-
-def fecha(d):
-    return datetime.combine(d, FECHA)
-
-
-def alinhar(t):
-    """Primeiro instante >= t que cai dentro do expediente."""
-    d = t.date()
-    if not eh_util(d):
-        return abre(proximo_util(d))
-    if t < abre(d):
-        return abre(d)
-    if t >= fecha(d):
-        return abre(proximo_util(d))
-    return t
-
-
-def somar_expediente(inicio, minutos):
-    """Avança `minutos` de trabalho a partir de `inicio`, pulando noites e folgas."""
-    t, restante = alinhar(inicio), float(minutos)
-    while True:
-        disponivel = (fecha(t.date()) - t).total_seconds() / 60
-        if restante <= disponivel:
-            return t + timedelta(minutes=restante)
-        restante -= disponivel
-        t = abre(proximo_util(t.date()))
-
 
 def instante_conserto(inicio, trabalho, tipo):
     """Reparo curto/médio corre em relógio corrido (a equipe fica até resolver),
-    a menos que passasse das 20h: aí retoma no expediente seguinte. Reparo
-    longo espera peça de fornecedor e só avança em expediente."""
+    a menos que passasse de 3h depois do fechamento: aí retoma no expediente
+    seguinte. Reparo longo espera peça de fornecedor e só avança em expediente."""
     if tipo != 'longa':
         fim = inicio + timedelta(minutes=trabalho)
-        if fim.date() == inicio.date() and fim.time() <= time(20, 0):
+        limite = fechamento_do_dia(inicio.date()) + timedelta(hours=3)
+        if fim.date() == inicio.date() and fim <= limite:
             return fim
     return somar_expediente(inicio, trabalho)
 
 
 def sortear_instante(rng, dias):
-    return abre(rng.choice(dias)) + timedelta(seconds=rng.randint(0, JORNADA_MIN * 60 - 1))
+    return abertura_do_dia(rng.choice(dias)) + timedelta(seconds=rng.randint(0, JORNADA_MIN * 60 - 1))
 
 
 def latencia(rng):
@@ -185,17 +145,17 @@ def achar_slot(rng, bloqueios, a_partir_de, duracao):
     """Primeiro início >= a_partir_de em que a operação cabe inteira num
     expediente e não cruza nenhum bloqueio (parada de máquina ou execução real
     já gravada)."""
-    t = alinhar(a_partir_de)
+    t = alinhar_ao_expediente(a_partir_de)
     while True:
         fim = t + duracao
-        if fim > fecha(t.date()):
-            t = abre(proximo_util(t.date())) + timedelta(
+        if fim > fechamento_do_dia(t.date()):
+            t = proxima_abertura(t.date()) + timedelta(
                 minutes=rng.randint(0, 20), seconds=rng.randint(0, 59))
             continue
         conflito = next((b for b in bloqueios if b[0] < fim and t < b[1]), None)
         if conflito is None:
             return t
-        t = alinhar(conflito[1] + latencia(rng))
+        t = alinhar_ao_expediente(conflito[1] + latencia(rng))
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +286,7 @@ def gerar_paradas(rng, ctx, dias, agora):
 def gerar_plano(rng, ctx, n, agora):
     hoje = agora.date()
     dias = sorted(d for d in (hoje - timedelta(days=k) for k in range(1, SEMANAS * 7 + 1))
-                  if eh_util(d))
+                  if eh_dia_util(d))
 
     codigos = sorted(ctx['roteiros'])
     pecas = [codigos[i % len(codigos)] for i in range(n)]
@@ -377,11 +337,11 @@ def gerar_plano(rng, ctx, n, agora):
         for op in roteiro:
             mid = ctx['maquinas'][op['maquina']]
             fim_fila = max((fp for fp, fr in fila_plan[mid] if fr > t_proc and fp > t_proc),
-                           default=t_proc)
+                           default=alinhar_ao_expediente(t_proc))
             parada = any(a <= t_proc < b for a, b in paradas[mid])
-            disponivel_em = t_proc + timedelta(minutes=FOLGA_MAQUINA_PARADA_MIN) if parada else t_proc
-            ini_p = max(fim_anterior, fim_fila, disponivel_em)
-            fim_p = ini_p + timedelta(minutes=op['tempo_estimado'])
+            disponivel_em = somar_expediente(t_proc, FOLGA_MAQUINA_PARADA_MIN) if parada else t_proc
+            ini_p = alinhar_ao_expediente(max(fim_anterior, fim_fila, disponivel_em))
+            fim_p = somar_expediente(ini_p, op['tempo_estimado'])
             entrada = [fim_p, datetime.max]
             fila_plan[mid].append(entrada)
             entradas.append(entrada)
@@ -407,6 +367,7 @@ def gerar_plano(rng, ctx, n, agora):
                 'maquina_id': mid, 'sequencia': op['sequencia'],
                 'estimado': op['tempo_estimado'],
                 'inicio_planejado': ini_p, 'fim_planejado': fim_p,
+                'tempo_planejado_min': op['tempo_estimado'],
                 'inicio_real': ini_r, 'fim_real': fim_r,
                 'tempo_realizado_min': minutos, 'classe': classe,
                 'operador': operador_de[mid],
@@ -463,11 +424,13 @@ def gravar(conn, plano):
             for op in nt['ops']:
                 c.execute('''INSERT INTO alocacao_maquinas
                              (ordem_servico_id, maquina_id, sequencia, status,
-                              inicio_planejado, fim_planejado, inicio_real, fim_real,
+                              inicio_planejado, fim_planejado, tempo_planejado_min,
+                              inicio_real, fim_real,
                               tempo_realizado_min, operador, observacao)
-                             VALUES (?, ?, ?, 'CONCLUIDO', ?, ?, ?, ?, ?, ?, ?)''',
+                             VALUES (?, ?, ?, 'CONCLUIDO', ?, ?, ?, ?, ?, ?, ?, ?)''',
                           (os_id, op['maquina_id'], op['sequencia'],
                            op['inicio_planejado'].isoformat(), op['fim_planejado'].isoformat(),
+                           op['tempo_planejado_min'],
                            op['inicio_real'].isoformat(), op['fim_real'].isoformat(),
                            op['tempo_realizado_min'], op['operador'], op['observacao']))
 

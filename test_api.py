@@ -5,10 +5,13 @@ Pytest coverage dos endpoints principais e dos diferenciais
 
 import io
 import json
+from datetime import date, datetime
 
 import pytest
 
-from app import app, init_db, seed_data, seed_usuarios
+from app import (AutomacaoUsinagem, alinhar_ao_expediente, app, eh_dia_util,
+                 feriados_do_ano, get_db, init_db, seed_data, seed_usuarios,
+                 somar_expediente)
 
 
 @pytest.fixture
@@ -382,6 +385,267 @@ class TestOrigemDados:
     def test_programacao_traz_origem_dados(self, client):
         data = self._get(client, '/api/programacao')
         assert set(data['origem_dados']) == {'real', 'demonstracao'}
+
+
+class TestExpediente:
+    """Planejamento só em minutos de expediente (seg-sex, 7h-17h por padrão)."""
+
+    # 2026-09-21 é segunda-feira.
+    SEG, TER, SEX = (datetime(2026, 9, 21), datetime(2026, 9, 22), datetime(2026, 9, 25))
+    SAB, DOM, SEG2 = (datetime(2026, 9, 26), datetime(2026, 9, 27), datetime(2026, 9, 28))
+
+    @pytest.fixture(autouse=True)
+    def expediente_padrao(self, monkeypatch):
+        import app as app_module
+        monkeypatch.setattr(app_module, 'EXPEDIENTE_INICIO_H', 7)
+        monkeypatch.setattr(app_module, 'EXPEDIENTE_FIM_H', 17)
+
+    def test_120_min_as_16h_terminam_as_8h_do_dia_util_seguinte(self):
+        assert somar_expediente(self.SEG.replace(hour=16), 120) == self.TER.replace(hour=8)
+
+    def test_60_min_as_16h_terminam_no_fechamento_do_mesmo_dia(self):
+        assert somar_expediente(self.SEG.replace(hour=16), 60) == self.SEG.replace(hour=17)
+
+    def test_sexta_a_tarde_atravessa_o_fim_de_semana(self):
+        assert somar_expediente(self.SEX.replace(hour=16), 120) == self.SEG2.replace(hour=8)
+
+    def test_dia_inteiro_termina_no_fechamento_e_mais_um_minuto_vai_para_o_proximo_dia(self):
+        assert somar_expediente(self.SEG.replace(hour=7), 600) == self.SEG.replace(hour=17)
+        assert somar_expediente(self.SEG.replace(hour=7), 601) == self.TER.replace(hour=7, minute=1)
+
+    def test_operacao_maior_que_um_dia_consome_varios_expedientes(self):
+        assert somar_expediente(self.SEG.replace(hour=7), 700) == self.TER.replace(hour=8, minute=40)
+
+    def test_inicio_fora_do_expediente_empurra_para_a_proxima_abertura(self):
+        assert alinhar_ao_expediente(self.SEG.replace(hour=6)) == self.SEG.replace(hour=7)
+        assert alinhar_ao_expediente(self.SEG.replace(hour=17)) == self.TER.replace(hour=7)
+        assert alinhar_ao_expediente(self.SEG.replace(hour=22)) == self.TER.replace(hour=7)
+        assert alinhar_ao_expediente(self.SAB.replace(hour=10)) == self.SEG2.replace(hour=7)
+        assert alinhar_ao_expediente(self.DOM.replace(hour=12)) == self.SEG2.replace(hour=7)
+        assert alinhar_ao_expediente(self.SEG.replace(hour=10, minute=30)) == self.SEG.replace(hour=10, minute=30)
+        assert somar_expediente(self.SAB.replace(hour=10), 60) == self.SEG2.replace(hour=8)
+
+    def test_processar_nota_grava_planejado_so_dentro_do_expediente(self, client):
+        """Chama processar_nota direto (a rota POST /api/notas notifica o Telegram)."""
+        conn = get_db()
+        nota_id = None
+        try:
+            nota_id = conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status)
+                                      VALUES ('TESTE-EXPEDIENTE-1', '40-091799', 1, 'RECEBIDA')''').lastrowid
+            conn.commit()
+            resultado = AutomacaoUsinagem.processar_nota(nota_id)
+            assert resultado['status'] == 'SUCESSO'
+
+            ops = json.loads(client.get(f"/api/ordens-servico/{resultado['os_id']}/operacoes").data)
+            assert len(ops) >= 1
+            for op in ops:
+                ini = datetime.fromisoformat(op['inicio_planejado'])
+                fim = datetime.fromisoformat(op['fim_planejado'])
+                assert ini.weekday() < 5 and fim.weekday() < 5
+                assert 7 <= ini.hour < 17
+                assert (7, 0, 0) < (fim.hour, fim.minute, fim.second) <= (17, 0, 0)
+                # a duração planejada é a estimada, mesmo que fim - início inclua a noite
+                assert op['tempo_planejado_min'] in {o['tempo'] for o in resultado['operacoes']}
+        finally:
+            if nota_id is not None:
+                os_ids = [r[0] for r in conn.execute('SELECT id FROM ordens_servico WHERE nota_id = ?', (nota_id,))]
+                for os_id in os_ids:
+                    conn.execute('DELETE FROM alocacao_maquinas WHERE ordem_servico_id = ?', (os_id,))
+                    conn.execute("DELETE FROM auditoria WHERE entidade = 'ORDEM_SERVICO' AND entidade_id = ?", (os_id,))
+                conn.execute('DELETE FROM ordens_servico WHERE nota_id = ?', (nota_id,))
+                conn.execute("DELETE FROM auditoria WHERE entidade = 'NOTA' AND entidade_id = ?", (nota_id,))
+                conn.execute('DELETE FROM notas WHERE id = ?', (nota_id,))
+            conn.commit()
+            conn.close()
+
+    def test_programacao_tem_eixo_do_expediente_e_barra_recortada_por_dia(self, client):
+        """Operação planejada de 16h a 8h aparece 16-17 num dia e 7-8 no outro."""
+        conn = get_db()
+        ids = {}
+        try:
+            ids['nota'] = conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status)
+                                          VALUES ('TESTE-EXPEDIENTE-2', '40-091799', 1, 'PROCESSADA')''').lastrowid
+            ids['os'] = conn.execute('''INSERT INTO ordens_servico (numero, nota_id, status, prioridade, tempo_total)
+                                        VALUES ('TESTE-EXPEDIENTE-OS', ?, 'PLANEJAMENTO', 'NORMAL', 120)''',
+                                     (ids['nota'],)).lastrowid
+            maquina_id = conn.execute('SELECT id FROM maquinas LIMIT 1').fetchone()[0]
+            conn.execute('''INSERT INTO alocacao_maquinas
+                            (ordem_servico_id, maquina_id, sequencia, status,
+                             inicio_planejado, fim_planejado, tempo_planejado_min)
+                            VALUES (?, ?, 1, 'PLANEJADO', '2099-03-02T16:00:00', '2099-03-03T08:00:00', 120)''',
+                         (ids['os'], maquina_id))
+            conn.commit()
+
+            for dia, esperado in (('2099-03-02', ('16:00', '17:00', 60)),
+                                  ('2099-03-03', ('07:00', '08:00', 60))):
+                data = json.loads(client.get(f'/api/programacao?data={dia}').data)
+                assert (data['janela_inicio'], data['janela_fim']) == ('07:00', '17:00')
+                barras = [b for m in data['maquinas'] for b in m['barras'] if b['os_numero'] == 'TESTE-EXPEDIENTE-OS']
+                assert len(barras) == 1
+                p = barras[0]['planejado']
+                assert (p['inicio'], p['fim'], p['minutos']) == esperado
+        finally:
+            conn.execute('DELETE FROM alocacao_maquinas WHERE ordem_servico_id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM ordens_servico WHERE id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM notas WHERE id = ?', (ids.get('nota'),))
+            conn.commit()
+            conn.close()
+
+    @staticmethod
+    def _janela_com_alocacao(client, dia, **campos):
+        """Cria nota/OS/alocação de teste com os campos dados, consulta a
+        programação de `dia`, limpa tudo e devolve (janela_inicio, janela_fim)."""
+        conn = get_db()
+        ids = {}
+        try:
+            ids['nota'] = conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status)
+                                          VALUES ('TESTE-EXPEDIENTE-J', '40-091799', 1, 'PROCESSADA')''').lastrowid
+            ids['os'] = conn.execute('''INSERT INTO ordens_servico (numero, nota_id, status, prioridade, tempo_total)
+                                        VALUES ('TESTE-EXPEDIENTE-OSJ', ?, 'PLANEJAMENTO', 'NORMAL', 60)''',
+                                     (ids['nota'],)).lastrowid
+            maquina_id = conn.execute('SELECT id FROM maquinas LIMIT 1').fetchone()[0]
+            conn.execute('''INSERT INTO alocacao_maquinas
+                            (ordem_servico_id, maquina_id, sequencia, status,
+                             inicio_planejado, fim_planejado, tempo_planejado_min,
+                             inicio_real, fim_real)
+                            VALUES (?, ?, 1, 'CONCLUIDO', ?, ?, 60, ?, ?)''',
+                         (ids['os'], maquina_id, campos.get('ini_p'), campos.get('fim_p'),
+                          campos.get('ini_r'), campos.get('fim_r')))
+            conn.commit()
+            data = json.loads(client.get(f'/api/programacao?data={dia}').data)
+            return data['janela_inicio'], data['janela_fim']
+        finally:
+            conn.execute('DELETE FROM alocacao_maquinas WHERE ordem_servico_id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM ordens_servico WHERE id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM notas WHERE id = ?', (ids.get('nota'),))
+            conn.commit()
+            conn.close()
+
+    def test_execucao_real_de_outro_dia_nao_estende_o_eixo(self, client):
+        """Planejada na segunda, executada na terça: o eixo da segunda continua 7h-17h."""
+        janela = self._janela_com_alocacao(
+            client, '2099-03-02',
+            ini_p='2099-03-02T15:00:00', fim_p='2099-03-02T16:00:00',
+            ini_r='2099-03-03T08:00:00', fim_r='2099-03-03T09:00:00')
+        assert janela == ('07:00', '17:00')
+
+    def test_execucao_real_fora_do_expediente_estende_o_eixo_so_o_necessario(self, client):
+        """Executada 6h10-7h40 no próprio dia: nada some, o eixo abre às 6h."""
+        janela = self._janela_com_alocacao(
+            client, '2099-03-02',
+            ini_p='2099-03-02T07:00:00', fim_p='2099-03-02T08:00:00',
+            ini_r='2099-03-02T06:10:00', fim_r='2099-03-02T07:40:00')
+        assert janela == ('06:00', '17:00')
+
+    def test_programacao_nao_desenha_planejado_no_fim_de_semana(self, client):
+        """Sexta 16h -> segunda 8h: sábado e domingo não têm barra planejada."""
+        conn = get_db()
+        ids = {}
+        try:
+            ids['nota'] = conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status)
+                                          VALUES ('TESTE-EXPEDIENTE-3', '40-091799', 1, 'PROCESSADA')''').lastrowid
+            ids['os'] = conn.execute('''INSERT INTO ordens_servico (numero, nota_id, status, prioridade, tempo_total)
+                                        VALUES ('TESTE-EXPEDIENTE-OS3', ?, 'PLANEJAMENTO', 'NORMAL', 120)''',
+                                     (ids['nota'],)).lastrowid
+            maquina_id = conn.execute('SELECT id FROM maquinas LIMIT 1').fetchone()[0]
+            # 2099-03-06 é sexta-feira
+            conn.execute('''INSERT INTO alocacao_maquinas
+                            (ordem_servico_id, maquina_id, sequencia, status,
+                             inicio_planejado, fim_planejado, tempo_planejado_min)
+                            VALUES (?, ?, 1, 'PLANEJADO', '2099-03-06T16:00:00', '2099-03-09T08:00:00', 120)''',
+                         (ids['os'], maquina_id))
+            conn.commit()
+
+            for dia in ('2099-03-07', '2099-03-08'):
+                data = json.loads(client.get(f'/api/programacao?data={dia}').data)
+                barras = [b for m in data['maquinas'] for b in m['barras'] if b['os_numero'] == 'TESTE-EXPEDIENTE-OS3']
+                assert barras == [], f'{dia} não deveria ter barra planejada'
+            sexta = json.loads(client.get('/api/programacao?data=2099-03-06').data)
+            assert any(b['os_numero'] == 'TESTE-EXPEDIENTE-OS3' and b['planejado']['minutos'] == 60
+                       for m in sexta['maquinas'] for b in m['barras'])
+        finally:
+            conn.execute('DELETE FROM alocacao_maquinas WHERE ordem_servico_id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM ordens_servico WHERE id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM notas WHERE id = ?', (ids.get('nota'),))
+            conn.commit()
+            conn.close()
+
+
+class TestFeriados:
+    """Feriados nacionais (fixos e derivados da Páscoa) não são dia útil."""
+
+    # Domingos de Páscoa publicados, para conferir o algoritmo.
+    PASCOAS = {2020: (4, 12), 2021: (4, 4), 2022: (4, 17), 2023: (4, 9), 2024: (3, 31),
+               2025: (4, 20), 2026: (4, 5), 2027: (3, 28), 2028: (4, 16), 2030: (4, 21)}
+
+    @pytest.fixture(autouse=True)
+    def expediente_padrao(self, monkeypatch):
+        import app as app_module
+        monkeypatch.setattr(app_module, 'EXPEDIENTE_INICIO_H', 7)
+        monkeypatch.setattr(app_module, 'EXPEDIENTE_FIM_H', 17)
+
+    def test_pascoa_bate_com_as_datas_publicadas(self):
+        from app import _pascoa
+        for ano, (mes, dia) in self.PASCOAS.items():
+            assert _pascoa(ano) == date(ano, mes, dia), ano
+
+    def test_feriados_de_2026(self):
+        assert feriados_do_ano(2026) == {
+            date(2026, 1, 1), date(2026, 2, 16), date(2026, 2, 17),   # Ano Novo, Carnaval seg e ter
+            date(2026, 4, 3), date(2026, 4, 21), date(2026, 5, 1),    # Sexta-feira Santa, Tiradentes, Trabalho
+            date(2026, 6, 4), date(2026, 9, 7), date(2026, 10, 12),   # Corpus Christi, Independência, Aparecida
+            date(2026, 11, 2), date(2026, 11, 15), date(2026, 12, 25),
+        }
+
+    def test_moveis_de_outros_anos(self):
+        assert {date(2025, 3, 3), date(2025, 3, 4), date(2025, 4, 18), date(2025, 6, 19)} <= feriados_do_ano(2025)
+        assert {date(2024, 2, 12), date(2024, 2, 13), date(2024, 3, 29), date(2024, 5, 30)} <= feriados_do_ano(2024)
+
+    def test_feriado_em_dia_de_semana_nao_e_util_e_aceita_datetime(self):
+        assert not eh_dia_util(date(2026, 9, 7))                 # segunda-feira, Independência
+        assert not eh_dia_util(datetime(2026, 9, 7, 10, 0))
+        assert eh_dia_util(date(2026, 9, 8))                     # terça normal
+        assert not eh_dia_util(date(2026, 9, 5))                 # sábado continua não sendo
+
+    def test_planejador_pula_o_feriado(self):
+        # sexta 04/09 16h + 120 min: 60 na sexta; segunda 07/09 é feriado; termina terça 08/09 8h
+        assert somar_expediente(datetime(2026, 9, 4, 16), 120) == datetime(2026, 9, 8, 8)
+        assert alinhar_ao_expediente(datetime(2026, 9, 7, 10)) == datetime(2026, 9, 8, 7)
+        # Sexta-feira Santa: quinta 02/04 16h + 120 -> 60 na quinta, sex feriado, fds, segunda 08h
+        assert somar_expediente(datetime(2026, 4, 2, 16), 120) == datetime(2026, 4, 6, 8)
+
+    def test_programacao_nao_desenha_planejado_no_feriado(self, client):
+        """Operação sexta 16h -> terça 8h: barra na sexta e na terça, nenhuma na segunda (feriado)."""
+        conn = get_db()
+        ids = {}
+        try:
+            ids['nota'] = conn.execute('''INSERT INTO notas (numero, peca_codigo, quantidade, status)
+                                          VALUES ('TESTE-FERIADO-1', '40-091799', 1, 'PROCESSADA')''').lastrowid
+            ids['os'] = conn.execute('''INSERT INTO ordens_servico (numero, nota_id, status, prioridade, tempo_total)
+                                        VALUES ('TESTE-FERIADO-OS', ?, 'PLANEJAMENTO', 'NORMAL', 120)''',
+                                     (ids['nota'],)).lastrowid
+            maquina_id = conn.execute('SELECT id FROM maquinas LIMIT 1').fetchone()[0]
+            conn.execute('''INSERT INTO alocacao_maquinas
+                            (ordem_servico_id, maquina_id, sequencia, status,
+                             inicio_planejado, fim_planejado, tempo_planejado_min)
+                            VALUES (?, ?, 1, 'PLANEJADO', '2026-09-04T16:00:00', '2026-09-08T08:00:00', 120)''',
+                         (ids['os'], maquina_id))
+            conn.commit()
+
+            def barras(dia):
+                data = json.loads(client.get(f'/api/programacao?data={dia}').data)
+                return [b for m in data['maquinas'] for b in m['barras'] if b['os_numero'] == 'TESTE-FERIADO-OS']
+
+            assert barras('2026-09-07') == []
+            sexta, terca = barras('2026-09-04'), barras('2026-09-08')
+            assert [(b['planejado']['inicio'], b['planejado']['fim']) for b in sexta] == [('16:00', '17:00')]
+            assert [(b['planejado']['inicio'], b['planejado']['fim']) for b in terca] == [('07:00', '08:00')]
+        finally:
+            conn.execute('DELETE FROM alocacao_maquinas WHERE ordem_servico_id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM ordens_servico WHERE id = ?', (ids.get('os'),))
+            conn.execute('DELETE FROM notas WHERE id = ?', (ids.get('nota'),))
+            conn.commit()
+            conn.close()
 
 
 if __name__ == '__main__':
