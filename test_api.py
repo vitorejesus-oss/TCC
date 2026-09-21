@@ -594,8 +594,14 @@ class TestFeriados:
             date(2026, 1, 1), date(2026, 2, 16), date(2026, 2, 17),   # Ano Novo, Carnaval seg e ter
             date(2026, 4, 3), date(2026, 4, 21), date(2026, 5, 1),    # Sexta-feira Santa, Tiradentes, Trabalho
             date(2026, 6, 4), date(2026, 9, 7), date(2026, 10, 12),   # Corpus Christi, Independência, Aparecida
-            date(2026, 11, 2), date(2026, 11, 15), date(2026, 12, 25),
+            date(2026, 11, 2), date(2026, 11, 15), date(2026, 11, 20),  # Finados, República, Consciência Negra
+            date(2026, 12, 25),
         }
+
+    def test_consciencia_negra_e_feriado_nacional_so_a_partir_de_2024(self):
+        assert date(2023, 11, 20) not in feriados_do_ano(2023)
+        for ano in (2024, 2025, 2026, 2030):
+            assert date(ano, 11, 20) in feriados_do_ano(ano), ano
 
     def test_moveis_de_outros_anos(self):
         assert {date(2025, 3, 3), date(2025, 3, 4), date(2025, 4, 18), date(2025, 6, 19)} <= feriados_do_ano(2025)
@@ -613,6 +619,11 @@ class TestFeriados:
         assert alinhar_ao_expediente(datetime(2026, 9, 7, 10)) == datetime(2026, 9, 8, 7)
         # Sexta-feira Santa: quinta 02/04 16h + 120 -> 60 na quinta, sex feriado, fds, segunda 08h
         assert somar_expediente(datetime(2026, 4, 2, 16), 120) == datetime(2026, 4, 6, 8)
+        # Consciência Negra (sexta 20/11/2026): quinta 19/11 16h + 120 min -> segunda 23/11 8h
+        assert somar_expediente(datetime(2026, 11, 19, 16), 120) == datetime(2026, 11, 23, 8)
+        assert alinhar_ao_expediente(datetime(2026, 11, 20, 10)) == datetime(2026, 11, 23, 7)
+        # em 2023 o 20/11 (segunda) ainda era dia útil
+        assert alinhar_ao_expediente(datetime(2023, 11, 20, 10)) == datetime(2023, 11, 20, 10)
 
     def test_programacao_nao_desenha_planejado_no_feriado(self, client):
         """Operação sexta 16h -> terça 8h: barra na sexta e na terça, nenhuma na segunda (feriado)."""

@@ -925,6 +925,10 @@ class GeradorRelatorio:
 
 # Feriados nacionais de data fixa, como (mês, dia).
 FERIADOS_FIXOS = ((1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (12, 25))
+# Dia da Consciência Negra: feriado nacional a partir de 2024 (Lei 14.759/2023).
+# Antes disso era só estadual/municipal, então não entra nos anos anteriores.
+CONSCIENCIA_NEGRA = (11, 20)
+CONSCIENCIA_NEGRA_DESDE = 2024
 
 
 def _pascoa(ano):
@@ -946,13 +950,17 @@ def _pascoa(ano):
 def feriados_do_ano(ano):
     """Feriados nacionais do ano: os de data fixa e os que dependem da Páscoa.
 
-    Móveis: Carnaval (segunda e terça, 48 e 47 dias antes), Sexta-feira Santa
+    Fixos: os de FERIADOS_FIXOS mais o Dia da Consciência Negra (20/11) a
+    partir de 2024. Móveis: Carnaval (segunda e terça, 48 e 47 dias antes), Sexta-feira Santa
     (2 dias antes) e Corpus Christi (60 dias depois). Não há feriados
     estaduais nem municipais.
     """
     pascoa = _pascoa(ano)
     moveis = [pascoa + timedelta(days=n) for n in (-48, -47, -2, 60)]
-    return frozenset(date(ano, mes, dia) for mes, dia in FERIADOS_FIXOS) | frozenset(moveis)
+    fixos = list(FERIADOS_FIXOS)
+    if ano >= CONSCIENCIA_NEGRA_DESDE:
+        fixos.append(CONSCIENCIA_NEGRA)
+    return frozenset(date(ano, mes, dia) for mes, dia in fixos) | frozenset(moveis)
 
 
 def eh_feriado(d):
