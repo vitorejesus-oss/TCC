@@ -353,52 +353,31 @@ def seed_data():
             c.execute('INSERT OR IGNORE INTO pecas (codigo, nome, descricao) VALUES (?, ?, ?)',
                      (codigo, nome, desc))
 
-        # Operações (histórico)
-        c.execute('SELECT id FROM pecas WHERE codigo = ?', ('40-091799',))
-        peca1_id = c.fetchone()[0]
-        operacoes1 = [
-            (peca1_id, 1, 'Torno Horizontal', 120, 'Usinagem cilíndrica'),
-            (peca1_id, 2, 'Torno Vertical', 90, 'Acabamento superficial'),
-        ]
-        for peca_id, seq, maq, tempo, desc in operacoes1:
-            c.execute('''INSERT INTO operacoes
-                        (peca_id, sequencia, maquina, tempo_estimado, descricao)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(peca_id, sequencia) DO UPDATE SET
-                            maquina = excluded.maquina,
-                            tempo_estimado = excluded.tempo_estimado,
-                            descricao = excluded.descricao''',
-                     (peca_id, seq, maq, tempo, desc))
+        # Roteiros de exemplo (sequência, máquina, tempo estimado, descrição).
+        # Só semeia a peça que AINDA NÃO TEM roteiro: quem já tem, inclusive
+        # por importação de catálogo (importar_pecas.py), não é sobrescrito a
+        # cada partida do app.
+        roteiros = {
+            '40-091799': [(1, 'Torno Horizontal', 120, 'Usinagem cilíndrica'),
+                          (2, 'Torno Vertical', 90, 'Acabamento superficial')],
+            '40-122633': [(1, 'Fresadora Universal', 150, 'Usinagem em fresadora')],
+            '40-154120': [(1, 'Retificadora Cilíndrica', 200, 'Polimento fino')],
+        }
+        for codigo, ops in roteiros.items():
+            peca_id = c.execute('SELECT id FROM pecas WHERE codigo = ?', (codigo,)).fetchone()[0]
+            if c.execute('SELECT COUNT(*) FROM operacoes WHERE peca_id = ?', (peca_id,)).fetchone()[0]:
+                continue
+            for seq, maq, tempo, desc in ops:
+                c.execute('''INSERT INTO operacoes
+                            (peca_id, sequencia, maquina, tempo_estimado, descricao)
+                            VALUES (?, ?, ?, ?, ?)''', (peca_id, seq, maq, tempo, desc))
 
-        c.execute('SELECT id FROM pecas WHERE codigo = ?', ('40-122633',))
-        peca2_id = c.fetchone()[0]
-        operacoes2 = [
-            (peca2_id, 1, 'Fresadora Universal', 150, 'Usinagem em fresadora'),
-        ]
-        for peca_id, seq, maq, tempo, desc in operacoes2:
-            c.execute('''INSERT INTO operacoes
-                        (peca_id, sequencia, maquina, tempo_estimado, descricao)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(peca_id, sequencia) DO UPDATE SET
-                            maquina = excluded.maquina,
-                            tempo_estimado = excluded.tempo_estimado,
-                            descricao = excluded.descricao''',
-                     (peca_id, seq, maq, tempo, desc))
-
-        c.execute('SELECT id FROM pecas WHERE codigo = ?', ('40-154120',))
-        peca3_id = c.fetchone()[0]
-        operacoes3 = [
-            (peca3_id, 1, 'Retificadora Cilíndrica', 200, 'Polimento fino'),
-        ]
-        for peca_id, seq, maq, tempo, desc in operacoes3:
-            c.execute('''INSERT INTO operacoes
-                        (peca_id, sequencia, maquina, tempo_estimado, descricao)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(peca_id, sequencia) DO UPDATE SET
-                            maquina = excluded.maquina,
-                            tempo_estimado = excluded.tempo_estimado,
-                            descricao = excluded.descricao''',
-                     (peca_id, seq, maq, tempo, desc))
+        # Bancos de antes da troca do parque de máquinas (abaixo) ainda têm os
+        # nomes antigos nos roteiros; processar_nota acha a máquina pelo nome.
+        for antigo, novo in (('CENTUR', 'Torno Horizontal'), ('D1250', 'Torno Vertical'),
+                             ('FRESADORA', 'Fresadora Universal'),
+                             ('POLITRIZ', 'Retificadora Cilíndrica')):
+            c.execute('UPDATE operacoes SET maquina = ? WHERE maquina = ?', (novo, antigo))
 
         # Máquinas reais da siderúrgica (substituem o parque fictício
         # CENTUR/D1250/FRESADORA/POLITRIZ usado até a v1 do sistema).
