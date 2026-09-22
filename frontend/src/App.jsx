@@ -296,7 +296,11 @@ function ChatManutencao({ token, socket }) {
   );
 }
 
-function ModalMaquina({ maquina, token, onClose, onUpdate }) {
+function ModalMaquina({ maquina, token, role, onClose, onUpdate }) {
+  // Mesma regra do backend (requer_roles em /quebrada e /consertada, Etapa 0
+  // do bot do Telegram): quem não pode fazer a ação nem vê o botão.
+  const podeReportarQuebra = role === 'operador' || role === 'coordenador';
+  const podeConsertar = role === 'coordenador';
   const [loading, setLoading] = useState(false);
   const [showRelatorio, setShowRelatorio] = useState(false);
   const [relatorio, setRelatorio] = useState('');
@@ -378,11 +382,12 @@ function ModalMaquina({ maquina, token, onClose, onUpdate }) {
 
         {!showRelatorio ? (
           <div className="modal-buttons">
-            {maquina.status === 'DISPONIVEL' ? (
+            {maquina.status === 'DISPONIVEL' && podeReportarQuebra && (
               <button onClick={handleNotificarQuebra} disabled={loading} className="btn-danger">
                 🚨 Notificar Quebra
               </button>
-            ) : (
+            )}
+            {maquina.status !== 'DISPONIVEL' && podeConsertar && (
               <button onClick={() => setShowRelatorio(true)} disabled={loading} className="btn-success">
                 ✅ Máquina Consertada
               </button>
@@ -419,7 +424,7 @@ function ModalMaquina({ maquina, token, onClose, onUpdate }) {
 // cada render do componente pai, o React remontava a árvore inteira
 // (inclusive o modal filho, mesmo ele sendo estável) a cada poll de 10s —
 // por isso "Nota de Relatório" voltava pro botão sozinho.
-function PainelManutencao({ maquinas, token, selectedMaquina, setSelectedMaquina, setMaquinas }) {
+function PainelManutencao({ maquinas, token, role, selectedMaquina, setSelectedMaquina, setMaquinas }) {
   const corStatus = { QUEBRADA: 'var(--vermelho)', DISPONIVEL: 'var(--verde)' };
   const emojiStatus = { QUEBRADA: '🔴', DISPONIVEL: '🟢' };
 
@@ -447,6 +452,7 @@ function PainelManutencao({ maquinas, token, selectedMaquina, setSelectedMaquina
         <ModalMaquina
           maquina={selectedMaquina}
           token={token}
+          role={role}
           onClose={() => setSelectedMaquina(null)}
           onUpdate={(atualizada) => {
             setMaquinas(prev => prev.map(m => m.id === atualizada.id ? atualizada : m));
@@ -488,7 +494,7 @@ function AvisoOrigemDados({ origemDados }) {
 // Fase 3 - Timeline da oficina. Fica NO NÍVEL DO MÓDULO (junto de
 // ModalVerMais e PainelManutencao), não dentro de SistemaAutomacao: ele tem
 // estado próprio (data, barra em foco) e seria remontado a cada poll de 10s.
-function PainelProgramacao() {
+function PainelProgramacao({ socket }) {
   const [dados, setDados] = useState(null);
   const [data, setData] = useState(() => dataLocal());
   const [carregando, setCarregando] = useState(true);
@@ -507,6 +513,27 @@ function PainelProgramacao() {
       .catch((e) => setErroProg(e.message))
       .finally(() => setCarregando(false));
   }, [data]);
+
+  // Uma operação iniciada ou concluída (pelo site ou, na Etapa 2, pelo bot do
+  // Telegram) muda esta tela sem precisar trocar de dia e voltar. Recarrega
+  // o dia em exibição em silêncio, sem passar pelo "Carregando..." de cima.
+  useEffect(() => {
+    if (!socket) return;
+    const recarregar = () => {
+      fetch(`${API_URL}/programacao?data=${data}`)
+        .then(async (r) => {
+          const json = await r.json();
+          if (r.ok) setDados(json);
+        })
+        .catch(() => {});
+    };
+    socket.on('operacao_iniciada', recarregar);
+    socket.on('operacao_concluida', recarregar);
+    return () => {
+      socket.off('operacao_iniciada', recarregar);
+      socket.off('operacao_concluida', recarregar);
+    };
+  }, [socket, data]);
 
   function mudarDia(dias) {
     const d = new Date(data + 'T12:00:00');
@@ -1517,7 +1544,7 @@ export default function SistemaAutomacao() {
       {tab === 'relatorio' && <PainelRelatorio />}
       {tab === 'backup' && <PainelBackup />}
       {tab === 'estatisticas' && <PainelEstatisticas />}
-      {tab === 'programacao' && <PainelProgramacao />}
+      {tab === 'programacao' && <PainelProgramacao socket={socketRef.current} />}
       {tab === 'login' && <PainelLogin />}
       {tab === 'manutencao' && (
         <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
@@ -1525,6 +1552,7 @@ export default function SistemaAutomacao() {
             <PainelManutencao
               maquinas={maquinas}
               token={token}
+              role={role}
               selectedMaquina={selectedMaquina}
               setSelectedMaquina={setSelectedMaquina}
               setMaquinas={setMaquinas}

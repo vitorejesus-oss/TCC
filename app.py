@@ -309,6 +309,12 @@ def init_db():
         if 'origem' not in {row[1] for row in c.fetchall()}:
             c.execute(f"ALTER TABLE {tabela} ADD COLUMN origem TEXT DEFAULT 'REAL'")
 
+    # --- Canal de onde a ação partiu: 'WEB' (todas até aqui) ou 'TELEGRAM'
+    # (a partir do bot, Etapa 1). registrar_auditoria() grava isso.
+    c.execute("PRAGMA table_info(auditoria)")
+    if 'canal' not in {row[1] for row in c.fetchall()}:
+        c.execute("ALTER TABLE auditoria ADD COLUMN canal TEXT DEFAULT 'WEB'")
+
     # Tabela de CHAT DE MANUTENÇÃO (Feature 4)
     c.execute('''CREATE TABLE IF NOT EXISTS chat_manutencao (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,14 +328,21 @@ def init_db():
     logger.info("Banco de dados inicializado")
     conn.close()
 
-def registrar_auditoria(tipo, entidade, entidade_id, descricao):
-    """Registra evento na auditoria"""
+def registrar_auditoria(tipo, entidade, entidade_id, descricao, usuario='SISTEMA', canal='WEB'):
+    """Registra evento na auditoria.
+
+    `usuario` é o e-mail de quem agiu (get_jwt_identity() no chamador); fica
+    'SISTEMA' para o que não tem requisição autenticada por trás (SAP,
+    backup agendado, notas criadas sem login). `canal` é 'WEB' por padrão;
+    a partir da Etapa 1 do bot, chamadas vindas de um JWT com o claim
+    'canal' passam esse valor (ver /api/telegram/token).
+    """
     conn = get_db()
     c = conn.cursor()
     c.execute('''INSERT INTO auditoria
-                 (tipo_evento, entidade, entidade_id, descricao, criado_em)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (tipo, entidade, entidade_id, descricao, datetime.now().isoformat()))
+                 (tipo_evento, entidade, entidade_id, descricao, usuario, canal, criado_em)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (tipo, entidade, entidade_id, descricao, usuario, canal, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -1579,7 +1592,7 @@ def iniciar_ordem(os_id):
                  ('EXECUTANDO', tempo_agora.isoformat(), email, os_id))
 
         conn.commit()
-        registrar_auditoria('INICIO', 'ORDEM_SERVICO', os_id, 'Execução iniciada')
+        registrar_auditoria('INICIO', 'ORDEM_SERVICO', os_id, 'Execução iniciada', usuario=email)
 
         return jsonify({'status': 'SUCESSO', 'mensagem': 'OS iniciada'}), 200
 
@@ -1859,7 +1872,7 @@ def get_programacao():
 
 
 @app.route('/api/alocacoes/<int:alocacao_id>/iniciar', methods=['POST'])
-@jwt_required()
+@requer_roles('operador', 'coordenador')
 def iniciar_alocacao(alocacao_id):
     """Operador assume uma operação liberada e começa a executá-la."""
     email = get_jwt_identity()
@@ -1893,7 +1906,8 @@ def iniciar_alocacao(alocacao_id):
         registrar_auditoria(
             'OPERACAO_INICIADA', 'ALOCACAO', alocacao_id,
             f"OP {aloc['sequencia']} da {aloc['os_numero']} iniciada por {email} "
-            f"na {aloc['maquina_nome']}"
+            f"na {aloc['maquina_nome']}",
+            usuario=email
         )
 
         socketio.emit('operacao_iniciada', {
@@ -1915,7 +1929,7 @@ def iniciar_alocacao(alocacao_id):
 
 
 @app.route('/api/alocacoes/<int:alocacao_id>/concluir', methods=['POST'])
-@jwt_required()
+@requer_roles('operador', 'coordenador')
 def concluir_alocacao(alocacao_id):
     """Conclui uma operação, mede o tempo gasto e libera a seguinte.
 
@@ -1990,13 +2004,15 @@ def concluir_alocacao(alocacao_id):
             'OPERACAO_CONCLUIDA', 'ALOCACAO', alocacao_id,
             f"OP {aloc['sequencia']} da {aloc['os_numero']} concluída por {email} "
             f"em {realizado if realizado is not None else '?'} min"
-            + (f". Observação: {observacao}" if observacao else '')
+            + (f". Observação: {observacao}" if observacao else ''),
+            usuario=email
         )
 
         if os_concluida:
             registrar_auditoria(
                 'OS_CONCLUIDA', 'ORDEM_SERVICO', aloc['ordem_servico_id'],
-                f"{aloc['os_numero']} concluída — peça {aloc['peca_codigo']}"
+                f"{aloc['os_numero']} concluída — peça {aloc['peca_codigo']}",
+                usuario=email
             )
 
         socketio.emit('operacao_concluida', {
@@ -2061,7 +2077,7 @@ def get_maquina_detalhe(maquina_id):
     return jsonify(dict(maquina))
 
 @app.route('/api/maquinas/<int:maquina_id>/quebrada', methods=['POST'])
-@jwt_required()
+@requer_roles('operador', 'coordenador')
 def marcar_maquina_quebrada(maquina_id):
     """Marca máquina como quebrada e notifica (WebSocket + Telegram)"""
     email = get_jwt_identity()
@@ -2080,7 +2096,7 @@ def marcar_maquina_quebrada(maquina_id):
     conn.commit()
     conn.close()
 
-    registrar_auditoria('MAQUINA_QUEBRADA', 'MAQUINA', maquina_id, f'Máquina marcada como quebrada por {email}')
+    registrar_auditoria('MAQUINA_QUEBRADA', 'MAQUINA', maquina_id, f'Máquina marcada como quebrada por {email}', usuario=email)
 
     socketio.emit('maquina_quebrada', {
         'id': maquina_id,
@@ -2106,7 +2122,7 @@ def marcar_maquina_quebrada(maquina_id):
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/api/maquinas/<int:maquina_id>/consertada', methods=['POST'])
-@jwt_required()
+@requer_roles('coordenador')
 def marcar_maquina_consertada(maquina_id):
     """Marca máquina como consertada, salva o relatório e notifica"""
     email = get_jwt_identity()
@@ -2148,7 +2164,7 @@ def marcar_maquina_consertada(maquina_id):
     conn.commit()
     conn.close()
 
-    registrar_auditoria('MAQUINA_CONSERTADA', 'MAQUINA', maquina_id, f'Máquina consertada por {email}: {relatorio}')
+    registrar_auditoria('MAQUINA_CONSERTADA', 'MAQUINA', maquina_id, f'Máquina consertada por {email}: {relatorio}', usuario=email)
 
     socketio.emit('maquina_consertada', {
         'id': maquina_id,
@@ -2201,7 +2217,7 @@ def enviar_chat_manutencao():
     nova_msg = dict(c.fetchone())
     conn.close()
 
-    registrar_auditoria('CHAT_MANUTENCAO', 'CHAT', msg_id, f'{email} ({role}): {mensagem}')
+    registrar_auditoria('CHAT_MANUTENCAO', 'CHAT', msg_id, f'{email} ({role}): {mensagem}', usuario=email)
 
     socketio.emit('chat_msg', nova_msg)
 
@@ -2346,7 +2362,7 @@ def login():
         return jsonify({'erro': 'Email ou senha inválidos'}), 401
 
     token = create_access_token(identity=email, additional_claims={'role': usuario['role']})
-    registrar_auditoria('LOGIN', 'USUARIO', usuario['id'], f'Login realizado: {email}')
+    registrar_auditoria('LOGIN', 'USUARIO', usuario['id'], f'Login realizado: {email}', usuario=email)
 
     return jsonify({'token': token, 'role': usuario['role'], 'usuario': email})
 

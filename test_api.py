@@ -282,6 +282,141 @@ class TestAutenticacao:
         assert response.status_code == 403
 
 
+class TestPermissoesEtapa0Bot:
+    """Etapa 0 do bot do Telegram: requer_roles nos 4 endpoints mutantes que
+    antes só exigiam `@jwt_required()` (qualquer papel autenticado passava),
+    conforme a tabela de permissões da seção 2 do brief."""
+
+    EMAILS = {'operador': 'operador@fabrica.com', 'coordenador': 'coordenador@fabrica.com',
+              'gestor': 'gestor@fabrica.com', 'diretor': 'diretor@fabrica.com'}
+
+    @classmethod
+    def _token(cls, client, papel):
+        r = client.post('/api/auth/login',
+                        data=json.dumps({'email': cls.EMAILS[papel], 'senha': 'Vitor367'}),
+                        content_type='application/json')
+        return json.loads(r.data)['token']
+
+    @staticmethod
+    def _maquina_id(client):
+        return json.loads(client.get('/api/maquinas').data)[0]['id']
+
+    @staticmethod
+    def _nova_alocacao(client):
+        """Cria uma nota (peça com roteiro de 2 operações) e devolve o id da
+        primeira alocação gerada, sempre nova e sem inicio_real."""
+        r = client.post('/api/notas',
+                        data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        return ops[0]['id']
+
+    @pytest.mark.parametrize('papel', ['gestor', 'diretor'])
+    def test_gestor_e_diretor_nao_iniciam_operacao(self, client, papel):
+        alocacao_id = self._nova_alocacao(client)
+        token = self._token(client, papel)
+        r = client.post(f'/api/alocacoes/{alocacao_id}/iniciar', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 403
+
+    @pytest.mark.parametrize('papel', ['gestor', 'diretor'])
+    def test_gestor_e_diretor_nao_concluem_operacao(self, client, papel):
+        alocacao_id = self._nova_alocacao(client)
+        token = self._token(client, papel)
+        r = client.post(f'/api/alocacoes/{alocacao_id}/concluir', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 403
+
+    @pytest.mark.parametrize('papel', ['operador', 'coordenador'])
+    def test_operador_e_coordenador_iniciam_e_concluem_operacao(self, client, papel):
+        alocacao_id = self._nova_alocacao(client)
+        token = self._token(client, papel)
+        headers = {'Authorization': f'Bearer {token}'}
+        r = client.post(f'/api/alocacoes/{alocacao_id}/iniciar', headers=headers)
+        assert r.status_code == 200, r.data
+        r = client.post(f'/api/alocacoes/{alocacao_id}/concluir', headers=headers,
+                        data=json.dumps({}), content_type='application/json')
+        assert r.status_code == 200, r.data
+
+    @pytest.mark.parametrize('papel', ['gestor', 'diretor'])
+    def test_gestor_e_diretor_nao_reportam_quebra(self, client, papel):
+        maquina_id = self._maquina_id(client)
+        token = self._token(client, papel)
+        r = client.post(f'/api/maquinas/{maquina_id}/quebrada', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 403
+
+    @pytest.mark.parametrize('papel', ['operador', 'coordenador'])
+    def test_operador_e_coordenador_reportam_quebra(self, client, papel):
+        maquina_id = self._maquina_id(client)
+        token = self._token(client, papel)
+        r = client.post(f'/api/maquinas/{maquina_id}/quebrada', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 200, r.data
+
+    @pytest.mark.parametrize('papel', ['operador', 'gestor', 'diretor'])
+    def test_so_coordenador_registra_conserto(self, client, papel):
+        maquina_id = self._maquina_id(client)
+        token = self._token(client, papel)
+        r = client.post(f'/api/maquinas/{maquina_id}/consertada', headers={'Authorization': f'Bearer {token}'},
+                        data=json.dumps({'relatorio': 'teste'}), content_type='application/json')
+        assert r.status_code == 403
+
+    def test_coordenador_registra_conserto(self, client):
+        maquina_id = self._maquina_id(client)
+        token = self._token(client, 'coordenador')
+        r = client.post(f'/api/maquinas/{maquina_id}/consertada', headers={'Authorization': f'Bearer {token}'},
+                        data=json.dumps({'relatorio': 'teste'}), content_type='application/json')
+        assert r.status_code == 200, r.data
+
+
+class TestAuditoriaUsuarioECanal:
+    """registrar_auditoria grava quem agiu e por qual canal (Etapa 0 do bot)."""
+
+    @staticmethod
+    def _ultimo_evento(client, tipo_evento):
+        eventos = json.loads(client.get('/api/auditoria').data)
+        for e in eventos:
+            if e['tipo_evento'] == tipo_evento:
+                return e
+        return None
+
+    def test_login_grava_usuario_e_canal_web(self, client):
+        client.post('/api/auth/login',
+                    data=json.dumps({'email': 'operador@fabrica.com', 'senha': 'Vitor367'}),
+                    content_type='application/json')
+        evento = self._ultimo_evento(client, 'LOGIN')
+        assert evento is not None
+        assert evento['usuario'] == 'operador@fabrica.com'
+        assert evento['canal'] == 'WEB'
+
+    def test_acao_sem_usuario_autenticado_grava_sistema(self, client):
+        """POST /api/notas não exige login: quem processa é o sistema."""
+        client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                   content_type='application/json')
+        evento = self._ultimo_evento(client, 'PROCESSAMENTO')
+        assert evento is not None
+        assert evento['usuario'] == 'SISTEMA'
+        assert evento['canal'] == 'WEB'
+
+    def test_quebra_e_conserto_gravam_o_coordenador_que_agiu(self, client):
+        maquina_id = json.loads(client.get('/api/maquinas').data)[0]['id']
+        login = client.post('/api/auth/login',
+                           data=json.dumps({'email': 'coordenador@fabrica.com', 'senha': 'Vitor367'}),
+                           content_type='application/json')
+        token = json.loads(login.data)['token']
+        headers = {'Authorization': f'Bearer {token}'}
+
+        r = client.post(f'/api/maquinas/{maquina_id}/quebrada', headers=headers)
+        assert r.status_code == 200, r.data
+        evento = self._ultimo_evento(client, 'MAQUINA_QUEBRADA')
+        assert evento['usuario'] == 'coordenador@fabrica.com'
+
+        r = client.post(f'/api/maquinas/{maquina_id}/consertada', headers=headers,
+                       data=json.dumps({'relatorio': 'ok'}), content_type='application/json')
+        assert r.status_code == 200, r.data
+        evento = self._ultimo_evento(client, 'MAQUINA_CONSERTADA')
+        assert evento['usuario'] == 'coordenador@fabrica.com'
+        assert evento['canal'] == 'WEB'
+
+
 class TestBackup:
     """Diferencial #6 - Backup automático"""
 
