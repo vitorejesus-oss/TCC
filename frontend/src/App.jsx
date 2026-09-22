@@ -1028,7 +1028,7 @@ export default function SistemaAutomacao() {
                   <td><span className={ordem.prioridade === 'URGENTE' ? 'badge-urgente' : 'badge-normal'}>{ordem.prioridade}</span></td>
                   <td><span className="status-badge">{ordem.status}</span></td>
                   <td>
-                    {ordem.status === 'PLANEJAMENTO' && (
+                    {ordem.status === 'PLANEJAMENTO' && (role === 'operador' || role === 'coordenador') && (
                       <button onClick={() => iniciarOrdem(ordem.id)} className="btn-pequeno">Iniciar</button>
                     )}
                   </td>

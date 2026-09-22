@@ -9,19 +9,28 @@ from datetime import date, datetime
 
 import pytest
 
-from app import (AutomacaoUsinagem, alinhar_ao_expediente, app, eh_dia_util,
+from app import (AutomacaoUsinagem, DB_PATH, alinhar_ao_expediente, app, eh_dia_util,
                  feriados_do_ano, get_db, init_db, seed_data, seed_usuarios,
                  somar_expediente)
+from clean_sap import limpar_sap
 
 
 @pytest.fixture
 def client():
-    """Setup do cliente de teste"""
+    """Setup do cliente de teste.
+
+    init_db()/seed_data()/seed_usuarios() são idempotentes, mas não apagam
+    notas: se o mesmo usinagem.db já tiver 'SAP-NOT-*' de uma rodada
+    anterior de test_importar_sap_arquivo, esse teste vê "já processada" e
+    falha. limpar_sap() (clean_sap.py, escrito exatamente para isso, mas
+    nunca chamado por nada) resolve isso de uma vez por todas aqui.
+    """
     app.config['TESTING'] = True
     with app.app_context():
         init_db()
         seed_data()
         seed_usuarios()
+        limpar_sap(db_path=DB_PATH)
         with app.test_client() as client:
             yield client
 

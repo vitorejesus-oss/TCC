@@ -1560,7 +1560,7 @@ def get_ordem(os_id):
     return jsonify(resultado)
 
 @app.route('/api/ordens-servico/<int:os_id>/iniciar', methods=['POST'])
-@jwt_required()
+@requer_roles('operador', 'coordenador')
 def iniciar_ordem(os_id):
     """Inicia execução de uma OS"""
     email = get_jwt_identity()
