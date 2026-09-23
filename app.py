@@ -13,6 +13,7 @@ import time
 import shutil
 import smtplib
 import sqlite3
+import secrets
 import logging
 import threading
 from io import BytesIO
@@ -88,6 +89,15 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://frontend-xi-two-5l7d05gqtg.vercel.app')
 DESENHOS_DIR = 'desenhos_tecnicos'
+
+# Bot do Telegram (Etapa 1) - token de serviço bot->API, nunca o token do
+# BotFather (esse é do bot_telegram.py). Sem isto configurado, /vincular e
+# /token recusam qualquer chamada (ver _bot_autorizado).
+BOT_SERVICE_TOKEN = os.getenv('BOT_SERVICE_TOKEN')
+BOT_JWT_EXPIRES_MIN = int(os.getenv('BOT_JWT_EXPIRES_MIN', '15'))
+VINCULO_CODIGO_EXPIRA_MIN = int(os.getenv('VINCULO_CODIGO_EXPIRA_MIN', '10'))
+VINCULO_MAX_TENTATIVAS = int(os.getenv('VINCULO_MAX_TENTATIVAS', '5'))
+VINCULO_BLOQUEIO_MIN = int(os.getenv('VINCULO_BLOQUEIO_MIN', '15'))
 
 MESES_PT = {
     1: 'Janeiro', 2: 'Fevereiro', 3: 'Março', 4: 'Abril',
@@ -324,19 +334,62 @@ def init_db():
         criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
+    # --- Bot do Telegram, Etapa 1: vínculo de conta ---------------------------
+    c.execute("PRAGMA table_info(usuarios)")
+    if 'telegram_id' not in {row[1] for row in c.fetchall()}:
+        c.execute('ALTER TABLE usuarios ADD COLUMN telegram_id INTEGER')
+    # Índice único à parte: SQLite não deixa declarar UNIQUE num ADD COLUMN.
+    # NULL não conflita com NULL, então usuários ainda não vinculados convivem.
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_telegram_id ON usuarios(telegram_id)')
+
+    # Código de 6 dígitos gerado no site e trocado pelo vínculo no bot. Um por
+    # usuário: gerar de novo apaga o anterior (ver gerar_codigo_telegram).
+    c.execute('''CREATE TABLE IF NOT EXISTS vinculos_pendentes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario_id INTEGER NOT NULL,
+        codigo TEXT NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expira_em TIMESTAMP NOT NULL,
+        FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_vinculos_codigo ON vinculos_pendentes(codigo)')
+
+    # Tentativas erradas de /vincular, por telegram_id (não por código: um
+    # palpite errado não bate em nenhuma linha de vinculos_pendentes, então
+    # não dá pra contar tentativa ali). Bloqueia esse telegram_id por um
+    # tempo depois de VINCULO_MAX_TENTATIVAS erros seguidos.
+    c.execute('''CREATE TABLE IF NOT EXISTS tentativas_vinculo_telegram (
+        telegram_id INTEGER PRIMARY KEY,
+        tentativas INTEGER DEFAULT 0,
+        bloqueado_ate TIMESTAMP
+    )''')
+
     conn.commit()
     logger.info("Banco de dados inicializado")
     conn.close()
 
-def registrar_auditoria(tipo, entidade, entidade_id, descricao, usuario='SISTEMA', canal='WEB'):
+def registrar_auditoria(tipo, entidade, entidade_id, descricao, usuario='SISTEMA', canal=None):
     """Registra evento na auditoria.
 
     `usuario` é o e-mail de quem agiu (get_jwt_identity() no chamador); fica
     'SISTEMA' para o que não tem requisição autenticada por trás (SAP,
-    backup agendado, notas criadas sem login). `canal` é 'WEB' por padrão;
-    a partir da Etapa 1 do bot, chamadas vindas de um JWT com o claim
-    'canal' passam esse valor (ver /api/telegram/token).
+    backup agendado, notas criadas sem login).
+
+    `canal`, quando não informado explicitamente, vem do claim 'canal' do
+    JWT da requisição atual: 'WEB' nos tokens do site (não têm esse claim,
+    então cai no padrão), 'TELEGRAM' nos tokens emitidos por
+    /api/telegram/token. As rotas que o bot chama (iniciar/concluir
+    operação, quebra, conserto, chat) são as MESMAS do site e não sabem
+    nada disso — é essa leitura implícita que faz o canal aparecer certo
+    sem tocar em nenhuma delas.
     """
+    if canal is None:
+        canal = 'WEB'
+        try:
+            canal = get_jwt().get('canal', 'WEB')
+        except Exception:
+            pass  # rota pública ou fora de contexto de requisição (ex.: backup agendado)
+
     conn = get_db()
     c = conn.cursor()
     c.execute('''INSERT INTO auditoria
@@ -2050,6 +2103,28 @@ def get_pecas():
     conn.close()
     return jsonify(pecas)
 
+CODIGO_PECA_REGEX = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+@app.route('/api/pecas/<codigo>/desenho', methods=['GET'])
+def get_desenho_tecnico(codigo):
+    """Desenho técnico em PDF de uma peça, se existir.
+
+    Não havia rota nenhuma servindo isto: o único caminho de hoje é
+    enviar_nota_telegram() lendo o arquivo do disco local do backend e
+    mandando direto para o grupo. O bot do Telegram é outro processo — se
+    ele lesse esse arquivo do próprio disco, ia depender de rodar na mesma
+    máquina que o backend, o que quebra em produção. Daí esta rota: o bot
+    busca o PDF pela API, como qualquer outro cliente.
+    """
+    if not CODIGO_PECA_REGEX.match(codigo):
+        return jsonify({'erro': 'Código de peça inválido'}), 400
+    nome_arquivo = f'{codigo}.pdf'
+    if not os.path.isfile(os.path.join(DESENHOS_DIR, nome_arquivo)):
+        return jsonify({'erro': 'Desenho técnico não encontrado para esta peça'}), 404
+    return send_from_directory(DESENHOS_DIR, nome_arquivo, mimetype='application/pdf')
+
+
 @app.route('/fotos_maquinas/<filename>')
 def serve_foto(filename):
     return send_from_directory('fotos_maquinas', filename)
@@ -2366,6 +2441,165 @@ def login():
 
     return jsonify({'token': token, 'role': usuario['role'], 'usuario': email})
 
+
+# ============================================================================
+# BOT DO TELEGRAM - ETAPA 1 (vínculo de conta)
+# ============================================================================
+#
+# O bot NÃO tem rotas próprias de domínio: ele troca telegram_id por um JWT
+# aqui e chama as MESMAS rotas que o site usa (/api/maquinas, /api/notas,
+# /api/painel/operador etc.) com esse token, como qualquer outro cliente.
+
+def _gerar_codigo_vinculo():
+    """6 dígitos, com zero à esquerda quando sair menor que 100000.
+    secrets.randbelow (não random.randint) porque isto é usado como senha
+    de uso único, mesmo que curta."""
+    return f'{secrets.randbelow(1_000_000):06d}'
+
+
+def _bot_autorizado():
+    """True só se BOT_SERVICE_TOKEN estiver configurado E bater com o
+    header X-Bot-Token da requisição. compare_digest evita que a diferença
+    de tempo de resposta vaze quantos caracteres já bateram (timing attack)."""
+    if not BOT_SERVICE_TOKEN:
+        return False
+    return secrets.compare_digest(request.headers.get('X-Bot-Token', ''), BOT_SERVICE_TOKEN)
+
+
+@app.route('/api/telegram/gerar-codigo', methods=['POST'])
+@jwt_required()
+def gerar_codigo_telegram():
+    """O usuário logado no site pede um código para vincular o Telegram.
+
+    Um código por usuário: gerar de novo apaga qualquer um ainda pendente
+    (uso único — não dá pra ter dois códigos válidos ao mesmo tempo para a
+    mesma conta).
+    """
+    email = get_jwt_identity()
+    conn = get_db()
+    c = conn.cursor()
+    usuario = c.execute('SELECT id FROM usuarios WHERE email = ?', (email,)).fetchone()
+    if not usuario:
+        conn.close()
+        return jsonify({'erro': 'Usuário não encontrado'}), 404
+
+    codigo = _gerar_codigo_vinculo()
+    expira_em = datetime.now() + timedelta(minutes=VINCULO_CODIGO_EXPIRA_MIN)
+
+    c.execute('DELETE FROM vinculos_pendentes WHERE usuario_id = ?', (usuario['id'],))
+    c.execute('INSERT INTO vinculos_pendentes (usuario_id, codigo, expira_em) VALUES (?, ?, ?)',
+             (usuario['id'], codigo, expira_em.isoformat()))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        'codigo': codigo,
+        'expira_em': expira_em.isoformat(),
+        'validade_minutos': VINCULO_CODIGO_EXPIRA_MIN,
+    }), 201
+
+
+@app.route('/api/telegram/vincular', methods=['POST'])
+def vincular_telegram():
+    """Chamado pelo bot (nunca pelo navegador): troca o código de 6 dígitos
+    pelo vínculo telegram_id <-> usuário. Exige o token de serviço do bot.
+    """
+    if not _bot_autorizado():
+        return jsonify({'erro': 'Token de serviço inválido'}), 401
+
+    dados = request.json or {}
+    codigo = (dados.get('codigo') or '').strip()
+    telegram_id = dados.get('telegram_id')
+
+    if not codigo or not telegram_id:
+        return jsonify({'erro': 'codigo e telegram_id são obrigatórios'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        agora = datetime.now()
+
+        bloqueio = c.execute(
+            'SELECT bloqueado_ate FROM tentativas_vinculo_telegram WHERE telegram_id = ?',
+            (telegram_id,)).fetchone()
+        if bloqueio and bloqueio['bloqueado_ate'] and datetime.fromisoformat(bloqueio['bloqueado_ate']) > agora:
+            return jsonify({'erro': 'Muitas tentativas erradas. Gere um novo código e tente de novo mais tarde.'}), 429
+
+        pendente = c.execute(
+            '''SELECT vp.id, vp.usuario_id, vp.expira_em, u.email, u.role
+               FROM vinculos_pendentes vp JOIN usuarios u ON u.id = vp.usuario_id
+               WHERE vp.codigo = ?''', (codigo,)).fetchone()
+        valido = pendente and datetime.fromisoformat(pendente['expira_em']) > agora
+
+        if not valido:
+            # Tentativa errada não bate em nenhuma linha de vinculos_pendentes
+            # (o código digitado pode nem existir), então o contador de
+            # tentativas é por telegram_id, não pelo código.
+            c.execute('''INSERT INTO tentativas_vinculo_telegram (telegram_id, tentativas, bloqueado_ate)
+                        VALUES (?, 1, NULL)
+                        ON CONFLICT(telegram_id) DO UPDATE SET
+                            tentativas = tentativas_vinculo_telegram.tentativas + 1,
+                            bloqueado_ate = CASE WHEN tentativas_vinculo_telegram.tentativas + 1 >= ?
+                                                 THEN ? ELSE NULL END''',
+                      (telegram_id, VINCULO_MAX_TENTATIVAS,
+                       (agora + timedelta(minutes=VINCULO_BLOQUEIO_MIN)).isoformat()))
+            conn.commit()
+            return jsonify({'erro': 'Código inválido ou expirado'}), 400
+
+        c.execute('UPDATE usuarios SET telegram_id = ? WHERE id = ?', (telegram_id, pendente['usuario_id']))
+        c.execute('DELETE FROM vinculos_pendentes WHERE id = ?', (pendente['id'],))
+        c.execute('DELETE FROM tentativas_vinculo_telegram WHERE telegram_id = ?', (telegram_id,))
+        conn.commit()
+
+        registrar_auditoria('VINCULO_TELEGRAM', 'USUARIO', pendente['usuario_id'],
+                           f"Telegram vinculado a {pendente['email']}",
+                           usuario=pendente['email'], canal='TELEGRAM')
+
+        return jsonify({'nome': pendente['email'], 'role': pendente['role']}), 200
+
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return jsonify({'erro': 'Este Telegram já está vinculado a outra conta'}), 409
+    finally:
+        conn.close()
+
+
+@app.route('/api/telegram/token', methods=['POST'])
+def token_telegram():
+    """Chamado pelo bot antes de repassar qualquer comando: troca um
+    telegram_id já vinculado por um JWT de curta duração. O papel vem de
+    `usuarios` na hora — nunca fica guardado no vínculo, então uma troca de
+    papel no banco vale no próximo comando, sem precisar vincular de novo.
+    """
+    if not _bot_autorizado():
+        return jsonify({'erro': 'Token de serviço inválido'}), 401
+
+    dados = request.json or {}
+    telegram_id = dados.get('telegram_id')
+    if not telegram_id:
+        return jsonify({'erro': 'telegram_id é obrigatório'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    usuario = c.execute('SELECT id, email, role FROM usuarios WHERE telegram_id = ?',
+                        (telegram_id,)).fetchone()
+    conn.close()
+
+    if not usuario:
+        return jsonify({'erro': 'telegram_id não vinculado a nenhuma conta'}), 404
+
+    token = create_access_token(
+        identity=usuario['email'],
+        additional_claims={'role': usuario['role'], 'canal': 'TELEGRAM'},
+        expires_delta=timedelta(minutes=BOT_JWT_EXPIRES_MIN))
+
+    registrar_auditoria('TOKEN_TELEGRAM', 'USUARIO', usuario['id'],
+                       f"Token Telegram emitido para {usuario['email']}",
+                       usuario=usuario['email'], canal='TELEGRAM')
+
+    return jsonify({'token': token, 'role': usuario['role'], 'usuario': usuario['email']}), 200
+
+
 @app.route('/api/painel/operador', methods=['GET'])
 @requer_roles('operador', 'coordenador', 'gestor', 'diretor')
 def painel_operador():
@@ -2452,6 +2686,7 @@ def get_logs():
 # --- Diferencial #10: Estatísticas customizadas -----------------------------
 
 @app.route('/api/estatisticas', methods=['GET'])
+@requer_roles('coordenador', 'gestor', 'diretor')
 def get_estatisticas():
     """Estatísticas de desempenho por máquina, por solicitante e economia semanal.
 
@@ -2520,6 +2755,7 @@ def get_estatisticas():
     })
 
 @app.route('/api/indicadores/manutencao', methods=['GET'])
+@requer_roles('coordenador', 'gestor', 'diretor')
 def indicadores_manutencao():
     """MTTR por máquina, a partir das intervenções com duração medida.
 

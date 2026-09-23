@@ -9,6 +9,7 @@ from datetime import date, datetime
 
 import pytest
 
+import app as app_module
 from app import (AutomacaoUsinagem, DB_PATH, alinhar_ao_expediente, app, eh_dia_util,
                  feriados_do_ano, get_db, init_db, seed_data, seed_usuarios,
                  somar_expediente)
@@ -24,6 +25,12 @@ def client():
     anterior de test_importar_sap_arquivo, esse teste vê "já processada" e
     falha. limpar_sap() (clean_sap.py, escrito exatamente para isso, mas
     nunca chamado por nada) resolve isso de uma vez por todas aqui.
+
+    O mesmo problema existe para o vínculo do bot: vinculos_pendentes,
+    tentativas_vinculo_telegram e usuarios.telegram_id também não são
+    tocados por seed_usuarios(), então uma rodada anterior (bloqueio de
+    tentativas, telegram_id já vinculado) vaza para a próxima. Zera os três
+    aqui, mesma lógica do limpar_sap().
     """
     app.config['TESTING'] = True
     with app.app_context():
@@ -31,6 +38,12 @@ def client():
         seed_data()
         seed_usuarios()
         limpar_sap(db_path=DB_PATH)
+        conn = get_db()
+        conn.execute('DELETE FROM vinculos_pendentes')
+        conn.execute('DELETE FROM tentativas_vinculo_telegram')
+        conn.execute('UPDATE usuarios SET telegram_id = NULL')
+        conn.commit()
+        conn.close()
         with app.test_client() as client:
             yield client
 
@@ -57,18 +70,36 @@ class TestPecas:
         assert len(data) > 0
         assert data[0]['codigo']
 
+    def test_desenho_tecnico_existente(self, client):
+        r = client.get('/api/pecas/40-091799/desenho')
+        assert r.status_code == 200
+        assert r.content_type == 'application/pdf'
+
+    def test_desenho_tecnico_inexistente(self, client):
+        r = client.get('/api/pecas/00-000000/desenho')
+        assert r.status_code == 404
+
+    @pytest.mark.parametrize('codigo', ['../app', '..%2Fapp.py', '40 091799', '40/091799'])
+    def test_desenho_tecnico_codigo_invalido_e_recusado(self, client, codigo):
+        r = client.get(f'/api/pecas/{codigo}/desenho')
+        assert r.status_code in (400, 404)  # 404 quando a barra nem chega a casar a rota
+
 
 class TestMaquinas:
     """Testes de Máquinas"""
 
     def test_listar_maquinas(self, client):
-        """Verifica se lista máquinas"""
+        """Verifica se lista máquinas. Não afirma o status de nenhuma em
+        particular: no banco real ele muda com o uso (máquina pode estar
+        QUEBRADA de verdade), e travar num valor deixa o teste refém do
+        estado ao vivo da demonstração."""
         response = client.get('/api/maquinas')
         assert response.status_code == 200
         data = json.loads(response.data)
         assert len(data) > 0
-        assert data[0]['nome']
-        assert data[0]['status'] == 'DISPONIVEL'
+        for maquina in data:
+            assert maquina['nome']
+            assert maquina['status'] in ('DISPONIVEL', 'QUEBRADA')
 
 
 class TestNotas:
@@ -426,6 +457,202 @@ class TestAuditoriaUsuarioECanal:
         assert evento['canal'] == 'WEB'
 
 
+class TestBotTelegramEtapa1:
+    """Vínculo de conta (Etapa 1 do bot): gerar-codigo, vincular, token."""
+
+    TOKEN_SERVICO = 'teste-token-de-servico-bot'
+
+    @pytest.fixture(autouse=True)
+    def servico_configurado(self, monkeypatch):
+        monkeypatch.setattr(app_module, 'BOT_SERVICE_TOKEN', self.TOKEN_SERVICO)
+
+    def _jwt_site(self, client, email='operador@fabrica.com'):
+        r = client.post('/api/auth/login', data=json.dumps({'email': email, 'senha': 'Vitor367'}),
+                        content_type='application/json')
+        return json.loads(r.data)['token']
+
+    def _gerar_codigo(self, client, email='operador@fabrica.com'):
+        token = self._jwt_site(client, email)
+        r = client.post('/api/telegram/gerar-codigo', headers={'Authorization': f'Bearer {token}'})
+        assert r.status_code == 201, r.data
+        return json.loads(r.data)
+
+    def _vincular(self, client, codigo, telegram_id=555, token_servico=None):
+        headers = {'X-Bot-Token': self.TOKEN_SERVICO if token_servico is None else token_servico}
+        return client.post('/api/telegram/vincular', headers=headers,
+                          data=json.dumps({'codigo': codigo, 'telegram_id': telegram_id}),
+                          content_type='application/json')
+
+    # --- gerar-codigo ---------------------------------------------------
+
+    def test_gerar_codigo_exige_login(self, client):
+        assert client.post('/api/telegram/gerar-codigo').status_code == 401
+
+    def test_gerar_codigo_tem_6_digitos_e_validade(self, client):
+        dados = self._gerar_codigo(client)
+        assert len(dados['codigo']) == 6 and dados['codigo'].isdigit()
+        assert dados['validade_minutos'] == 10
+
+    def test_gerar_codigo_de_novo_invalida_o_anterior(self, client):
+        primeiro = self._gerar_codigo(client)['codigo']
+        segundo = self._gerar_codigo(client)['codigo']
+        assert self._vincular(client, primeiro).status_code == 400
+        assert self._vincular(client, segundo, telegram_id=556).status_code == 200
+
+    # --- vincular ---------------------------------------------------------
+
+    def test_vincular_sem_token_de_servico_e_negado(self, client):
+        codigo = self._gerar_codigo(client)['codigo']
+        r = self._vincular(client, codigo, token_servico='')
+        assert r.status_code == 401
+
+    def test_vincular_com_token_de_servico_errado_e_negado(self, client):
+        codigo = self._gerar_codigo(client)['codigo']
+        r = self._vincular(client, codigo, token_servico='chute-qualquer')
+        assert r.status_code == 401
+
+    def test_vincular_com_bot_service_token_vazio_no_ambiente_nega_tudo(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, 'BOT_SERVICE_TOKEN', None)
+        codigo = self._gerar_codigo(client)['codigo']
+        assert self._vincular(client, codigo, token_servico='qualquer-coisa').status_code == 401
+        assert self._vincular(client, codigo, token_servico='').status_code == 401
+
+    def test_vincular_codigo_certo(self, client):
+        codigo = self._gerar_codigo(client)['codigo']
+        r = self._vincular(client, codigo, telegram_id=999)
+        assert r.status_code == 200
+        assert json.loads(r.data) == {'nome': 'operador@fabrica.com', 'role': 'operador'}
+
+        conn = get_db()
+        try:
+            row = conn.execute('SELECT telegram_id FROM usuarios WHERE email = ?',
+                              ('operador@fabrica.com',)).fetchone()
+            assert row['telegram_id'] == 999
+            assert conn.execute('SELECT COUNT(*) c FROM vinculos_pendentes').fetchone()['c'] == 0
+        finally:
+            conn.close()
+
+    def test_vincular_codigo_e_uso_unico(self, client):
+        codigo = self._gerar_codigo(client)['codigo']
+        assert self._vincular(client, codigo, telegram_id=201).status_code == 200
+        r = self._vincular(client, codigo, telegram_id=202)
+        assert r.status_code == 400
+        assert 'inválido' in json.loads(r.data)['erro'] or 'expirado' in json.loads(r.data)['erro']
+
+    def test_vincular_codigo_errado(self, client):
+        self._gerar_codigo(client)
+        r = self._vincular(client, '000000', telegram_id=203)
+        assert r.status_code == 400
+
+    def test_vincular_codigo_expirado(self, client):
+        dados = self._gerar_codigo(client)
+        conn = get_db()
+        try:
+            conn.execute("UPDATE vinculos_pendentes SET expira_em = ? WHERE codigo = ?",
+                        ('2000-01-01T00:00:00', dados['codigo']))
+            conn.commit()
+        finally:
+            conn.close()
+        assert self._vincular(client, dados['codigo'], telegram_id=204).status_code == 400
+
+    def test_mesmo_telegram_id_nao_vincula_duas_contas(self, client):
+        cod_operador = self._gerar_codigo(client, 'operador@fabrica.com')['codigo']
+        assert self._vincular(client, cod_operador, telegram_id=42).status_code == 200
+        cod_coord = self._gerar_codigo(client, 'coordenador@fabrica.com')['codigo']
+        r = self._vincular(client, cod_coord, telegram_id=42)
+        assert r.status_code == 409
+
+    def test_tentativas_erradas_bloqueiam_depois_de_5(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, 'VINCULO_MAX_TENTATIVAS', 5)
+        codigo_valido = self._gerar_codigo(client)['codigo']
+        for _ in range(5):
+            r = self._vincular(client, '000000', telegram_id=77)
+            assert r.status_code == 400
+        # 6a tentativa: mesmo com o codigo CERTO, o telegram_id ja esta bloqueado
+        r = self._vincular(client, codigo_valido, telegram_id=77)
+        assert r.status_code == 429
+
+    def test_tentativas_de_um_telegram_id_nao_afetam_outro(self, client):
+        for _ in range(5):
+            assert self._vincular(client, '000000', telegram_id=205).status_code == 400
+        codigo = self._gerar_codigo(client)['codigo']
+        assert self._vincular(client, codigo, telegram_id=206).status_code == 200
+
+    # --- token --------------------------------------------------------------
+
+    def test_token_exige_bot_service_token(self, client):
+        codigo = self._gerar_codigo(client)['codigo']
+        self._vincular(client, codigo, telegram_id=10)
+        r = client.post('/api/telegram/token', data=json.dumps({'telegram_id': 10}),
+                       content_type='application/json')
+        assert r.status_code == 401
+
+    def test_token_para_quem_nao_vinculou_falha(self, client):
+        r = client.post('/api/telegram/token', headers={'X-Bot-Token': self.TOKEN_SERVICO},
+                       data=json.dumps({'telegram_id': 123456}), content_type='application/json')
+        assert r.status_code == 404
+
+    def test_token_devolve_papel_atual_e_pode_ser_usado_na_api(self, client):
+        codigo = self._gerar_codigo(client, 'coordenador@fabrica.com')['codigo']
+        self._vincular(client, codigo, telegram_id=11)
+
+        r = client.post('/api/telegram/token', headers={'X-Bot-Token': self.TOKEN_SERVICO},
+                       data=json.dumps({'telegram_id': 11}), content_type='application/json')
+        assert r.status_code == 200
+        dados = json.loads(r.data)
+        assert dados['role'] == 'coordenador' and dados['usuario'] == 'coordenador@fabrica.com'
+
+        # o token do bot precisa valer nas MESMAS rotas do site, sem rota nova
+        maquina_id = json.loads(client.get('/api/maquinas').data)[0]['id']
+        r = client.post(f'/api/maquinas/{maquina_id}/quebrada',
+                       headers={'Authorization': f"Bearer {dados['token']}"})
+        assert r.status_code == 200, r.data
+
+    def test_token_le_o_papel_na_hora_nao_o_de_quando_vinculou(self, client):
+        codigo = self._gerar_codigo(client, 'operador@fabrica.com')['codigo']
+        self._vincular(client, codigo, telegram_id=12)
+
+        # Muda o papel do usuário demo DEPOIS do vínculo, pra provar que
+        # /token não usa um papel guardado na hora de vincular. Reverte no
+        # finally: essa conta é reaproveitada por outros testes na mesma
+        # cópia do banco.
+        conn = get_db()
+        try:
+            conn.execute("UPDATE usuarios SET role = 'coordenador' WHERE email = 'operador@fabrica.com'")
+            conn.commit()
+
+            r = client.post('/api/telegram/token', headers={'X-Bot-Token': self.TOKEN_SERVICO},
+                           data=json.dumps({'telegram_id': 12}), content_type='application/json')
+            assert json.loads(r.data)['role'] == 'coordenador'
+        finally:
+            conn.execute("UPDATE usuarios SET role = 'operador' WHERE email = 'operador@fabrica.com'")
+            conn.commit()
+            conn.close()
+
+    def test_canal_telegram_aparece_na_auditoria_so_para_acoes_do_bot(self, client):
+        codigo = self._gerar_codigo(client, 'coordenador@fabrica.com')['codigo']
+        self._vincular(client, codigo, telegram_id=13)
+        token_bot = json.loads(client.post(
+            '/api/telegram/token', headers={'X-Bot-Token': self.TOKEN_SERVICO},
+            data=json.dumps({'telegram_id': 13}), content_type='application/json').data)['token']
+
+        maquina_id = json.loads(client.get('/api/maquinas').data)[0]['id']
+        client.post(f'/api/maquinas/{maquina_id}/quebrada', headers={'Authorization': f'Bearer {token_bot}'})
+
+        eventos = json.loads(client.get('/api/auditoria').data)
+        via_bot = next(e for e in eventos if e['tipo_evento'] == 'MAQUINA_QUEBRADA')
+        assert via_bot['canal'] == 'TELEGRAM'
+        assert via_bot['usuario'] == 'coordenador@fabrica.com'
+
+        # a mesma ação pelo site (JWT sem claim canal) continua WEB
+        token_web = self._jwt_site(client, 'coordenador@fabrica.com')
+        client.post(f'/api/maquinas/{maquina_id}/consertada', headers={'Authorization': f'Bearer {token_web}'},
+                   data=json.dumps({'relatorio': 'ok'}), content_type='application/json')
+        eventos = json.loads(client.get('/api/auditoria').data)
+        via_site = next(e for e in eventos if e['tipo_evento'] == 'MAQUINA_CONSERTADA')
+        assert via_site['canal'] == 'WEB'
+
+
 class TestBackup:
     """Diferencial #6 - Backup automático"""
 
@@ -450,16 +677,43 @@ class TestLogs:
         assert isinstance(data, list)
 
 
+def _auth_papel(client, papel):
+    """Header Authorization para o papel (todos os usuários seed usam Vitor367)."""
+    r = client.post('/api/auth/login',
+                    data=json.dumps({'email': f'{papel}@fabrica.com', 'senha': 'Vitor367'}),
+                    content_type='application/json')
+    return {'Authorization': f'Bearer {json.loads(r.data)["token"]}'}
+
+
 class TestEstatisticas:
     """Diferencial #10 - Estatísticas customizadas"""
 
     def test_get_estatisticas(self, client):
-        response = client.get('/api/estatisticas')
+        response = client.get('/api/estatisticas', headers=_auth_papel(client, 'gestor'))
         assert response.status_code == 200
         data = json.loads(response.data)
         assert 'desempenho_por_maquina' in data
         assert 'notas_por_operador' in data
         assert 'economia_semanal' in data
+
+
+class TestPermissoesIndicadores:
+    """/api/estatisticas e /api/indicadores/manutencao: só coordenador, gestor e diretor."""
+
+    ROTAS = ['/api/estatisticas', '/api/indicadores/manutencao']
+
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_sem_token_401(self, client, rota):
+        assert client.get(rota).status_code == 401
+
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_operador_403(self, client, rota):
+        assert client.get(rota, headers=_auth_papel(client, 'operador')).status_code == 403
+
+    @pytest.mark.parametrize('papel', ['coordenador', 'gestor', 'diretor'])
+    @pytest.mark.parametrize('rota', ROTAS)
+    def test_papeis_permitidos_200(self, client, rota, papel):
+        assert client.get(rota, headers=_auth_papel(client, papel)).status_code == 200
 
 
 class TestOrigemDados:
@@ -469,7 +723,8 @@ class TestOrigemDados:
 
     @staticmethod
     def _get(client, rota, origem=None):
-        resposta = client.get(rota + (f'?origem={origem}' if origem else ''))
+        resposta = client.get(rota + (f'?origem={origem}' if origem else ''),
+                              headers=_auth_papel(client, 'gestor'))
         assert resposta.status_code == 200
         return json.loads(resposta.data)
 
@@ -489,7 +744,8 @@ class TestOrigemDados:
 
     @pytest.mark.parametrize('rota', ROTAS)
     def test_origem_invalida_retorna_400(self, client, rota):
-        assert client.get(rota + '?origem=INVENTADA').status_code == 400
+        assert client.get(rota + '?origem=INVENTADA',
+                          headers=_auth_papel(client, 'gestor')).status_code == 400
 
     def test_registro_de_demonstracao_entra_na_contagem_e_o_filtro_o_separa(self, client):
         """Insere uma nota e um relatório DEMONSTRACAO e confere que aparecem

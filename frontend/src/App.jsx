@@ -43,7 +43,8 @@ const MODULOS = [
     nome: 'Gestão',
     telas: [
       { id: 'gestao', nome: 'Indicadores' },
-      { id: 'estatisticas', nome: 'Estatísticas' },
+      // `papeis` = quem vê a tela (o backend também exige: /api/estatisticas)
+      { id: 'estatisticas', nome: 'Estatísticas', papeis: ['coordenador', 'gestor', 'diretor'] },
       { id: 'relatorio', nome: 'Relatório' },
       { id: 'auditoria', nome: 'Auditoria' },
       { id: 'backup', nome: 'Backup' },
@@ -782,7 +783,7 @@ export default function SistemaAutomacao() {
   // que são recriados a cada render — o efeito disparava a cada poll.
   useEffect(() => {
     if (tab === 'backup') carregarBackups();
-    if (tab === 'estatisticas') carregarEstatisticas();
+    if (tab === 'estatisticas' && telaPermitida('estatisticas')) carregarEstatisticas();
   }, [tab]);
 
   // Diferencial #4 - conecta ao WebSocket uma única vez
@@ -989,7 +990,10 @@ export default function SistemaAutomacao() {
 
   async function carregarEstatisticas() {
     try {
-      const res = await fetch(`${API_URL}/estatisticas`);
+      const res = await fetch(`${API_URL}/estatisticas`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      if (!res.ok) { setEstatisticas(null); return; }
       setEstatisticas(await res.json());
     } catch (e) {
       console.error(e);
@@ -1454,6 +1458,12 @@ export default function SistemaAutomacao() {
     );
   }
 
+  // Telas com `papeis` só aparecem (e só carregam) para esses papéis.
+  function telaPermitida(telaId) {
+    const t = MODULOS.flatMap((m) => m.telas).find((x) => x.id === telaId);
+    return !t || !t.papeis || t.papeis.includes(role);
+  }
+
   // Trocar de módulo leva para a primeira tela dele.
   function abrirModulo(moduloId) {
     const m = MODULOS.find((x) => x.id === moduloId);
@@ -1503,7 +1513,8 @@ export default function SistemaAutomacao() {
 
       {(() => {
         const moduloAtual = MODULOS.find((m) => m.id === modulo) || MODULOS[0];
-        const temSubmenu = moduloAtual.telas.length > 1;
+        const telasVisiveis = moduloAtual.telas.filter((t) => telaPermitida(t.id));
+        const temSubmenu = telasVisiveis.length > 1;
 
         return (
           <>
@@ -1521,7 +1532,7 @@ export default function SistemaAutomacao() {
 
             {temSubmenu && (
               <div className="telas">
-                {moduloAtual.telas.map((t) => (
+                {telasVisiveis.map((t) => (
                   <button
                     key={t.id}
                     className={`tela-btn ${tab === t.id ? 'active' : ''}`}
@@ -1543,7 +1554,7 @@ export default function SistemaAutomacao() {
       {tab === 'sap' && <PainelSap />}
       {tab === 'relatorio' && <PainelRelatorio />}
       {tab === 'backup' && <PainelBackup />}
-      {tab === 'estatisticas' && <PainelEstatisticas />}
+      {tab === 'estatisticas' && telaPermitida('estatisticas') && <PainelEstatisticas />}
       {tab === 'programacao' && <PainelProgramacao socket={socketRef.current} />}
       {tab === 'login' && <PainelLogin />}
       {tab === 'manutencao' && (
