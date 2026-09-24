@@ -2466,6 +2466,20 @@ def _bot_autorizado():
     return secrets.compare_digest(request.headers.get('X-Bot-Token', ''), BOT_SERVICE_TOKEN)
 
 
+@app.route('/api/telegram/status', methods=['GET'])
+@jwt_required()
+def status_telegram():
+    """Diz ao site se a conta do usuário logado já tem um Telegram vinculado
+    (a tela Acesso mostra isso no lugar do botão de gerar código)."""
+    conn = get_db()
+    linha = conn.execute('SELECT telegram_id FROM usuarios WHERE email = ?',
+                         (get_jwt_identity(),)).fetchone()
+    conn.close()
+    if not linha:
+        return jsonify({'erro': 'Usuário não encontrado'}), 404
+    return jsonify({'vinculado': linha['telegram_id'] is not None})
+
+
 @app.route('/api/telegram/gerar-codigo', methods=['POST'])
 @jwt_required()
 def gerar_codigo_telegram():

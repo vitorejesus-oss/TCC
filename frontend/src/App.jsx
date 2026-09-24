@@ -59,6 +59,86 @@ const MODULOS = [
   },
 ];
 
+// Vínculo do Telegram (tela Acesso). Fora do componente principal pelo mesmo
+// motivo do ModalVerMais: a contagem regressiva perderia o estado a cada poll.
+function VinculoTelegram({ token }) {
+  const [vinculado, setVinculado] = useState(null); // null = carregando
+  const [codigo, setCodigo] = useState(null);
+  const [fim, setFim] = useState(0); // instante (ms) em que o código expira
+  const [restante, setRestante] = useState(0);
+  const [erro, setErro] = useState('');
+  const headers = { Authorization: `Bearer ${token}` };
+
+  async function consultarStatus() {
+    try {
+      const res = await fetch(`${API_URL}/telegram/status`, { headers });
+      if (res.ok) setVinculado((await res.json()).vinculado);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function gerar() {
+    setErro('');
+    try {
+      const res = await fetch(`${API_URL}/telegram/gerar-codigo`, { method: 'POST', headers });
+      const data = await res.json();
+      if (!res.ok) { setErro(data.erro || 'Não foi possível gerar o código'); return; }
+      setCodigo(data.codigo);
+      setFim(Date.now() + data.validade_minutos * 60 * 1000);
+    } catch (e) {
+      setErro('Não consegui falar com o servidor');
+    }
+  }
+
+  useEffect(() => { consultarStatus(); }, [token]);
+
+  // Contagem regressiva; enquanto o código vale, confere a cada 3s se o
+  // vínculo já foi feito no Telegram para trocar a tela sozinha.
+  useEffect(() => {
+    if (!codigo) return undefined;
+    const tick = setInterval(() => {
+      const seg = Math.max(0, Math.round((fim - Date.now()) / 1000));
+      setRestante(seg);
+      if (seg === 0) { setCodigo(null); }
+    }, 1000);
+    const conferir = setInterval(consultarStatus, 3000);
+    setRestante(Math.max(0, Math.round((fim - Date.now()) / 1000)));
+    return () => { clearInterval(tick); clearInterval(conferir); };
+  }, [codigo, fim]);
+
+  const mm = String(Math.floor(restante / 60)).padStart(2, '0');
+  const ss = String(restante % 60).padStart(2, '0');
+
+  return (
+    <div style={{ marginTop: 24 }} data-testid="vinculo-telegram">
+      <h3 style={{ marginBottom: 10 }}>Telegram</h3>
+      {vinculado === null ? (
+        <p>Verificando...</p>
+      ) : vinculado ? (
+        <p>✅ Sua conta já está vinculada a um Telegram.</p>
+      ) : codigo ? (
+        <div>
+          <div style={{ fontSize: 40, fontWeight: 700, letterSpacing: 8, background: 'var(--cinza-bg)', border: '1px solid var(--cinza-borda)', borderRadius: 4, padding: '12px 20px', display: 'inline-block' }}>
+            {codigo}
+          </div>
+          <p style={{ marginTop: 10 }}>Expira em <strong>{mm}:{ss}</strong>. No Telegram, envie: <strong>/vincular {codigo}</strong></p>
+        </div>
+      ) : (
+        <div>
+          <button className="btn-nota" style={{ width: 'auto', padding: '12px 24px' }} onClick={gerar}>
+            Gerar código de vínculo
+          </button>
+          <p style={{ marginTop: 8, color: 'var(--cinza-texto)', fontSize: 13 }}>
+            Gera um código de 6 dígitos para usar com /vincular no bot.
+          </p>
+        </div>
+      )}
+      {erro && <p style={{ color: 'var(--vermelho)', marginTop: 8 }}>{erro}</p>}
+    </div>
+  );
+}
+
 // Feature 2 - Modal "Ver Mais": detalhes completos de uma nota.
 // Definida FORA do componente principal (não aninhada) de propósito: se
 // ficasse aninhada, cada re-render de SistemaAutomacao (o polling de 10s,
@@ -1557,6 +1637,10 @@ export default function SistemaAutomacao() {
       {tab === 'estatisticas' && telaPermitida('estatisticas') && <PainelEstatisticas />}
       {tab === 'programacao' && <PainelProgramacao socket={socketRef.current} />}
       {tab === 'login' && <PainelLogin />}
+      {/* Fora do PainelLogin (aninhado, remonta a cada poll de 10s e perderia o código e a contagem). */}
+      {tab === 'login' && token && (
+        <div className="painel"><VinculoTelegram token={token} /></div>
+      )}
       {tab === 'manutencao' && (
         <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 500px' }}>

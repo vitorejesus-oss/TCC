@@ -501,6 +501,16 @@ class TestBotTelegramEtapa1:
 
     # --- vincular ---------------------------------------------------------
 
+    def test_status_sem_token_401(self, client):
+        assert client.get('/api/telegram/status').status_code == 401
+
+    def test_status_reflete_o_vinculo(self, client):
+        h = {'Authorization': f'Bearer {self._jwt_site(client, "coordenador@fabrica.com")}'}
+        assert json.loads(client.get('/api/telegram/status', headers=h).data)['vinculado'] is False
+        codigo = self._gerar_codigo(client, 'coordenador@fabrica.com')['codigo']
+        assert self._vincular(client, codigo, telegram_id=777001).status_code == 200
+        assert json.loads(client.get('/api/telegram/status', headers=h).data)['vinculado'] is True
+
     def test_vincular_sem_token_de_servico_e_negado(self, client):
         codigo = self._gerar_codigo(client)['codigo']
         r = self._vincular(client, codigo, token_servico='')
