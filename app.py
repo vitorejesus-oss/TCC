@@ -348,7 +348,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         usuario_id INTEGER NOT NULL,
         codigo TEXT NOT NULL,
-        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        criado_em TIMESTAMP DEFAULT (datetime('now','localtime')),
         expira_em TIMESTAMP NOT NULL,
         FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
     )''')
@@ -2498,11 +2498,12 @@ def gerar_codigo_telegram():
         return jsonify({'erro': 'Usuário não encontrado'}), 404
 
     codigo = _gerar_codigo_vinculo()
-    expira_em = datetime.now() + timedelta(minutes=VINCULO_CODIGO_EXPIRA_MIN)
+    agora = datetime.now()  # hora local, igual a expira_em (o DEFAULT do banco seria UTC)
+    expira_em = agora + timedelta(minutes=VINCULO_CODIGO_EXPIRA_MIN)
 
     c.execute('DELETE FROM vinculos_pendentes WHERE usuario_id = ?', (usuario['id'],))
-    c.execute('INSERT INTO vinculos_pendentes (usuario_id, codigo, expira_em) VALUES (?, ?, ?)',
-             (usuario['id'], codigo, expira_em.isoformat()))
+    c.execute('INSERT INTO vinculos_pendentes (usuario_id, codigo, criado_em, expira_em) VALUES (?, ?, ?, ?)',
+             (usuario['id'], codigo, agora.isoformat(), expira_em.isoformat()))
     conn.commit()
     conn.close()
 

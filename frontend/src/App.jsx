@@ -826,7 +826,7 @@ export default function SistemaAutomacao() {
   const [usuarioLogado, setUsuarioLogado] = useState(() => localStorage.getItem('usuario') || '');
   const [role, setRole] = useState(() => localStorage.getItem('role') || '');
   const [loginEmail, setLoginEmail] = useState('operador@fabrica.com');
-  const [loginSenha, setLoginSenha] = useState('Vitor367');
+  const [loginSenha, setLoginSenha] = useState('');
   const [loginErro, setLoginErro] = useState(null);
   const [painelProtegido, setPainelProtegido] = useState(null);
 

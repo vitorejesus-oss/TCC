@@ -501,6 +501,18 @@ class TestBotTelegramEtapa1:
 
     # --- vincular ---------------------------------------------------------
 
+    def test_criado_em_e_expira_em_em_hora_local(self, client):
+        from datetime import datetime
+        antes = datetime.now().replace(microsecond=0)
+        self._gerar_codigo(client)
+        conn = app_module.get_db()
+        linha = conn.execute('SELECT criado_em, expira_em FROM vinculos_pendentes').fetchone()
+        conn.close()
+        criado = datetime.fromisoformat(linha['criado_em'])
+        expira = datetime.fromisoformat(linha['expira_em'])
+        assert 0 <= (criado - antes).total_seconds() < 5  # UTC daria horas de diferença (exceto fuso UTC)
+        assert (expira - criado).total_seconds() == pytest.approx(app_module.VINCULO_CODIGO_EXPIRA_MIN * 60, abs=1)
+
     def test_status_sem_token_401(self, client):
         assert client.get('/api/telegram/status').status_code == 401
 
