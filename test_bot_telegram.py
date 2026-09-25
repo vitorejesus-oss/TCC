@@ -263,3 +263,25 @@ class TestTextoBuscaOS:
     def test_avisa_quando_ha_mais_do_que_o_mostrado(self):
         itens = [{'numero': f'OS-{i}', 'peca_nome': 'X', 'status': 'CONCLUIDA', 'prioridade': 'NORMAL'} for i in range(5)]
         assert 'mostrando 5 de 12' in bt.texto_busca_os({'total': 12, 'itens': itens})
+
+
+class TestDesenhoProvisorioNoBot:
+    def _botoes(self, teclado):
+        return [(b.text, b.callback_data) for linha in teclado.inline_keyboard for b in linha]
+
+    def test_botao_provisorio_tem_rotulo_de_aviso_e_callback_proprio(self):
+        b = bt.botao_desenho('40-091799', provisorio=True)
+        assert (b.text, b.callback_data) == ('📄 Desenho (provisório)', 'dp:40-091799')
+        assert bt.botao_desenho('40-091799').callback_data == 'dw:40-091799'
+
+    def test_fila_usa_o_botao_provisorio_so_para_as_pecas_marcadas(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')]) + \
+            bt.operacoes_da_fila({**ORDEM, 'id': 8, 'numero': 'OS-8', 'peca_codigo': 'OUTRA'}, [_op(9, 1, 'LIBERADO')])
+        botoes = self._botoes(bt.teclado_fila(itens, 'operador', com_desenho=frozenset({'40-091799', 'OUTRA'}),
+                                              provisorios=frozenset({'40-091799'})))
+        assert ('📄 Desenho (provisório)', 'dp:40-091799') in botoes
+        assert ('📄 Desenho', 'dw:OUTRA') in botoes
+
+    def test_aviso_curto_e_claro(self):
+        assert 'provisório' in bt.AVISO_PROVISORIO and 'oficial' in bt.AVISO_PROVISORIO
+        assert len(bt.AVISO_PROVISORIO) < 120

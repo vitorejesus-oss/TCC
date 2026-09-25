@@ -1395,3 +1395,64 @@ class TestBuscaDeOS:
         r, _ = self._buscar(client, ordenar='os.id; DROP TABLE ordens_servico')
         assert r.status_code == 400
         assert self._buscar(client)[0].status_code == 200
+
+class TestDesenhoProvisorio:
+    """desenhos_tecnicos/PLACEHOLDERS.txt marca PDFs que são só um aviso, não o desenho oficial."""
+
+    @pytest.fixture
+    def pasta(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, 'DESENHOS_DIR', str(tmp_path))
+        for codigo in ('P-REAL', 'P-PROV'):
+            (tmp_path / f'{codigo}.pdf').write_bytes(b'%PDF-1.4\n%%EOF\n')
+        return tmp_path
+
+    def test_sem_arquivo_de_marcadores_nada_e_provisorio(self, pasta):
+        assert app_module.tem_desenho('P-PROV') and not app_module.desenho_provisorio('P-PROV')
+
+    def test_codigo_listado_e_provisorio_e_o_outro_nao(self, pasta):
+        (pasta / 'PLACEHOLDERS.txt').write_text('# comentário\n\nP-PROV\n', encoding='utf-8')
+        assert app_module.desenho_provisorio('P-PROV') is True
+        assert app_module.desenho_provisorio('P-REAL') is False
+
+    def test_comentario_e_linhas_vazias_nao_contam_como_codigo(self, pasta):
+        (pasta / 'PLACEHOLDERS.txt').write_text('# P-REAL\n   \n', encoding='utf-8')
+        assert app_module.desenho_provisorio('P-REAL') is False
+
+    def test_codigo_listado_sem_pdf_nao_e_provisorio_nem_tem_desenho(self, pasta):
+        (pasta / 'PLACEHOLDERS.txt').write_text('P-SEM-PDF\n', encoding='utf-8')
+        assert not app_module.tem_desenho('P-SEM-PDF') and not app_module.desenho_provisorio('P-SEM-PDF')
+
+    def test_lista_de_pecas_traz_desenho_provisorio(self, client, pasta):
+        conn = app_module.get_db()
+        try:
+            conn.execute("INSERT OR REPLACE INTO pecas (codigo, nome) VALUES ('P-PROV', 'Provisória')")
+            conn.execute("INSERT OR REPLACE INTO pecas (codigo, nome) VALUES ('P-REAL', 'Real')")
+            conn.commit()
+            (pasta / 'PLACEHOLDERS.txt').write_text('P-PROV\n', encoding='utf-8')
+            por_codigo = {p['codigo']: p for p in json.loads(client.get('/api/pecas').data)}
+            assert por_codigo['P-PROV']['tem_desenho'] is True and por_codigo['P-PROV']['desenho_provisorio'] is True
+            assert por_codigo['P-REAL']['tem_desenho'] is True and por_codigo['P-REAL']['desenho_provisorio'] is False
+        finally:
+            conn.execute("DELETE FROM pecas WHERE codigo IN ('P-PROV', 'P-REAL')")
+            conn.commit()
+            conn.close()
+
+    def test_o_pdf_provisorio_continua_sendo_servido(self, client, pasta):
+        (pasta / 'PLACEHOLDERS.txt').write_text('P-PROV\n', encoding='utf-8')
+        r = client.get('/api/pecas/P-PROV/desenho')
+        assert r.status_code == 200 and r.mimetype == 'application/pdf'
+
+    def test_arquivo_de_marcadores_nao_e_servido(self, client, pasta):
+        (pasta / 'PLACEHOLDERS.txt').write_text('P-PROV\n', encoding='utf-8')
+        assert client.get('/api/pecas/PLACEHOLDERS/desenho').status_code == 404
+
+    def test_detalhes_da_nota_trazem_a_marca(self, client):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        nota_id = json.loads(r.data)['nota_id']
+        peca = json.loads(client.get(f'/api/notas/{nota_id}/detalhes', headers=_auth_papel(client, 'operador')).data)['peca']
+        assert peca['tem_desenho'] is True and isinstance(peca['desenho_provisorio'], bool)
+        assert peca['desenho_provisorio'] is app_module.desenho_provisorio('40-091799')
+
+    def test_o_pdf_de_40_091799_no_repositorio_e_marcado_como_placeholder(self):
+        assert app_module.desenho_provisorio('40-091799') is True

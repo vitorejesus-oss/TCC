@@ -103,6 +103,18 @@ def tem_desenho(codigo):
         os.path.isfile(os.path.join(DESENHOS_DIR, f'{codigo}.pdf'))
 
 
+def desenho_provisorio(codigo):
+    """True se o PDF da peça é só um placeholder (código listado em
+    desenhos_tecnicos/PLACEHOLDERS.txt): existe arquivo, mas não é o desenho
+    oficial. Sem o arquivo de marcadores, nenhum PDF é tratado como provisório."""
+    try:
+        with open(os.path.join(DESENHOS_DIR, 'PLACEHOLDERS.txt'), encoding='utf-8') as f:
+            marcados = {l.strip() for l in f if l.strip() and not l.lstrip().startswith('#')}
+    except OSError:
+        return False
+    return tem_desenho(codigo) and codigo in marcados
+
+
 def ficha_da_peca(linha):
     """Ficha técnica de uma linha de `pecas`: só os campos preenchidos, mais
     quais faltam. Campo vazio não vira texto nenhum."""
@@ -1534,6 +1546,7 @@ def get_nota_detalhes(nota_id):
             'descricao': peca['descricao'] if peca else None,
             **(ficha_da_peca(peca) if peca else {'ficha': {}, 'ficha_faltando': list(FICHA_CAMPOS)}),
             'tem_desenho': tem_desenho(nota['peca_codigo']),
+            'desenho_provisorio': desenho_provisorio(nota['peca_codigo']),
         },
         'quantidade': nota['quantidade'],
         'prioridade': nota['prioridade'],
@@ -2331,6 +2344,7 @@ def get_pecas():
         p = {k: v for k, v in dict(row).items() if k not in FICHA_CAMPOS}   # a ficha vai em 'ficha'
         p.update(ficha_da_peca(row))
         p['tem_desenho'] = tem_desenho(p['codigo'])
+        p['desenho_provisorio'] = desenho_provisorio(p['codigo'])   # PDF existe, mas é placeholder
         pecas.append(p)
     conn.close()
     return jsonify(pecas)

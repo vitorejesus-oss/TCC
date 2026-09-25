@@ -199,18 +199,23 @@ def texto_fila_operacoes(itens, pode_executar=True):
     return '\n'.join(linhas)
 
 
-def botao_desenho(codigo):
-    """📄 Desenho da peça, ou None se o código não cabe no callback_data (64 bytes)."""
-    dados = f'dw:{codigo}'
+AVISO_PROVISORIO = '⚠️ Documento provisório: não é o desenho técnico oficial (ainda não cadastrado).'
+
+
+def botao_desenho(codigo, provisorio=False):
+    """📄 Desenho da peça, ou None se o código não cabe no callback_data (64 bytes).
+    Para PDF provisório (placeholder) o rótulo avisa e o callback é dp:, que
+    faz o envio vir com a legenda de aviso."""
+    dados = f"{'dp' if provisorio else 'dw'}:{codigo}"
     if not codigo or len(dados.encode()) > 64:
         return None
-    return InlineKeyboardButton('📄 Desenho', callback_data=dados)
+    return InlineKeyboardButton('📄 Desenho (provisório)' if provisorio else '📄 Desenho', callback_data=dados)
 
 
-def teclado_fila(itens, role, com_desenho=frozenset()):
+def teclado_fila(itens, role, com_desenho=frozenset(), provisorios=frozenset()):
     """Um botão por operação (Iniciar ou Concluir), só para quem executa, e o
     📄 Desenho da peça ao lado quando ela tem PDF cadastrado (`com_desenho` =
-    códigos de peça com desenho)."""
+    códigos de peça com PDF; `provisorios` = os que são só placeholder)."""
     if role not in PAPEIS_EXECUTAM:
         return None
     linhas = []
@@ -218,8 +223,9 @@ def teclado_fila(itens, role, com_desenho=frozenset()):
         acao, rotulo = ('c', '✅ Concluir') if it['status'] == 'EXECUTANDO' else ('i', '▶️ Iniciar')
         linha = [InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
                                       callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}")]
-        if it.get('peca_codigo') in com_desenho and botao_desenho(it['peca_codigo']):
-            linha.append(botao_desenho(it['peca_codigo']))
+        botao = botao_desenho(it.get('peca_codigo'), it.get('peca_codigo') in provisorios)
+        if it.get('peca_codigo') in com_desenho and botao:
+            linha.append(botao)
         linhas.append(linha)
     return InlineKeyboardMarkup(linhas) if linhas else None
 
@@ -473,8 +479,9 @@ def _fila_pronta(telegram_id):
         return erro, None
     pecas, _erro_pecas = chamar_api(telegram_id, 'GET', '/pecas')   # sem ela, só some o botão 📄
     com_desenho = frozenset(p['codigo'] for p in (pecas or []) if p.get('tem_desenho'))
+    provisorios = frozenset(p['codigo'] for p in (pecas or []) if p.get('desenho_provisorio'))
     return (texto_fila_operacoes(itens, pode_executar=role in PAPEIS_EXECUTAM),
-            teclado_fila(itens, role, com_desenho))
+            teclado_fila(itens, role, com_desenho, provisorios))
 
 
 async def fila(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,8 +596,12 @@ async def acao_operacao(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
             ficha = texto_ficha_curta(peca)
             if ficha:
                 texto += f"\n\n📐 {peca['nome']}\n{ficha}"
-            if peca and peca.get('tem_desenho') and botao_desenho(peca['codigo']):
-                extra = [botao_desenho(peca['codigo'])]
+            if peca and peca.get('tem_desenho'):
+                provisorio = bool(peca.get('desenho_provisorio'))
+                if botao_desenho(peca['codigo'], provisorio):
+                    extra = [botao_desenho(peca['codigo'], provisorio)]
+                if provisorio:
+                    texto += f"\n\n{AVISO_PROVISORIO}"
         teclado = _teclado_confirmar('ic' if acao == 'i' else 'cc', aid, os_id, extra)
         await query.edit_message_text(texto, reply_markup=teclado)
         return
@@ -656,11 +667,15 @@ async def desenho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text('Uso: /desenho 40-091799')
         return
-    await enviar_desenho(update.message, update.effective_user.id, context.args[0].strip())
+    codigo = context.args[0].strip()
+    pecas, _erro = chamar_api(update.effective_user.id, 'GET', '/pecas')
+    provisorio = any(p['codigo'] == codigo and p.get('desenho_provisorio') for p in (pecas or []))
+    await enviar_desenho(update.message, update.effective_user.id, codigo, provisorio)
 
 
-async def enviar_desenho(mensagem, telegram_id, codigo):
-    """Busca o PDF da peça pela API e o envia no chat de `mensagem`."""
+async def enviar_desenho(mensagem, telegram_id, codigo, provisorio=False):
+    """Busca o PDF da peça pela API e o envia no chat de `mensagem`, com a
+    legenda de aviso quando for só um documento provisório."""
     token, _role, _email = obter_sessao(telegram_id)
     if not token:
         await mensagem.reply_text('Você ainda não vinculou sua conta. Use /vincular <código>.')
@@ -674,7 +689,8 @@ async def enviar_desenho(mensagem, telegram_id, codigo):
         return
 
     if resp.status_code == 200:
-        await mensagem.reply_document(document=resp.content, filename=f'{codigo}.pdf')
+        await mensagem.reply_document(document=resp.content, filename=f'{codigo}.pdf',
+                                      caption=AVISO_PROVISORIO if provisorio else None)
     elif resp.status_code == 404:
         await mensagem.reply_text(f'Não achei desenho técnico para a peça {codigo}.')
     else:
@@ -705,8 +721,8 @@ async def botao_pressionado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await acao_operacao(update, context, query, acao)
         return
 
-    if acao.startswith('dw:'):   # 📄 Desenho: manda o PDF sem o operador digitar o código
-        await enviar_desenho(query.message, telegram_id, acao[3:])
+    if acao.startswith(('dw:', 'dp:')):   # 📄 Desenho: manda o PDF sem o operador digitar o código
+        await enviar_desenho(query.message, telegram_id, acao[3:], provisorio=acao.startswith('dp:'))
         return
 
     if acao == 'fila':

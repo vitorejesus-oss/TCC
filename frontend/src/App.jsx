@@ -109,16 +109,19 @@ function CatalogoPecas() {
   if (erro) return <div className="painel"><p>{erro}</p></div>;
   if (!pecas) return <div className="painel">Carregando...</div>;
 
-  const pendente = (p) => !p.tem_desenho || p.ficha_faltando.length > 0;
+  // Desenho real = PDF que existe E não é placeholder (desenhos_tecnicos/PLACEHOLDERS.txt).
+  const desenhoReal = (p) => p.tem_desenho && !p.desenho_provisorio;
+  const pendente = (p) => !desenhoReal(p) || p.ficha_faltando.length > 0;
   const visiveis = soPendentes ? pecas.filter(pendente) : pecas;
-  const comDesenho = pecas.filter((p) => p.tem_desenho).length;
+  const comDesenho = pecas.filter(desenhoReal).length;
+  const comPlaceholder = pecas.filter((p) => p.desenho_provisorio).length;
   const fichaCompleta = pecas.filter((p) => p.ficha_faltando.length === 0).length;
 
   return (
     <div className="painel">
       <h2>Catálogo de peças</h2>
       <p className="texto-suave" style={{ marginBottom: 14 }}>
-        {comDesenho} de {pecas.length} peça(s) com desenho técnico · {fichaCompleta} com ficha técnica completa.
+        {comDesenho} de {pecas.length} peça(s) com desenho real{comPlaceholder > 0 && ` (${comPlaceholder} só com placeholder)`} · {fichaCompleta} com ficha técnica completa.
         Desenho e ficha são cadastrados por quem tem o desenho em mãos (ficha: coluna do CSV de importação); o sistema não gera medidas.
       </p>
       <label style={{ display: 'block', marginBottom: 12 }}>
@@ -136,7 +139,9 @@ function CatalogoPecas() {
                 <td className="mono">{p.codigo}</td>
                 <td>{p.nome}</td>
                 <td>
-                  {p.tem_desenho ? (
+                  {p.desenho_provisorio ? (
+                    <a href={`${API_URL}/pecas/${encodeURIComponent(p.codigo)}/desenho`} target="_blank" rel="noopener noreferrer">⚠️ Placeholder</a>
+                  ) : p.tem_desenho ? (
                     <a href={`${API_URL}/pecas/${encodeURIComponent(p.codigo)}/desenho`} target="_blank" rel="noopener noreferrer">✅ Abrir PDF</a>
                   ) : (
                     <span className="texto-suave">— sem desenho</span>
@@ -152,12 +157,12 @@ function CatalogoPecas() {
                   )}
                 </td>
                 <td>
-                  {p.ficha_faltando.length === 0 && p.tem_desenho ? (
+                  {p.ficha_faltando.length === 0 && desenhoReal(p) ? (
                     <span style={{ color: 'var(--verde)' }}>Completa</span>
                   ) : (
                     <span>
-                      {!p.tem_desenho && 'Desenho'}
-                      {!p.tem_desenho && p.ficha_faltando.length > 0 && ' · '}
+                      {!desenhoReal(p) && (p.desenho_provisorio ? 'Desenho real' : 'Desenho')}
+                      {!desenhoReal(p) && p.ficha_faltando.length > 0 && ' · '}
                       {p.ficha_faltando.map((c) => ROTULOS_FICHA[c]).join(', ')}
                     </span>
                   )}
@@ -479,8 +484,15 @@ function ModalVerMais({ notaId, token, onClose }) {
             <section className="modal-section">
               <h3>📐 Desenho técnico</h3>
               {detalhes.peca.tem_desenho ? (
-                <a className="btn-pequeno" href={`${API_URL}/pecas/${encodeURIComponent(detalhes.peca.codigo)}/desenho`}
-                   target="_blank" rel="noopener noreferrer">📄 Abrir desenho (PDF)</a>
+                <>
+                  <a className="btn-pequeno" href={`${API_URL}/pecas/${encodeURIComponent(detalhes.peca.codigo)}/desenho`}
+                     target="_blank" rel="noopener noreferrer">
+                    {detalhes.peca.desenho_provisorio ? '📄 Abrir documento provisório (PDF)' : '📄 Abrir desenho (PDF)'}
+                  </a>
+                  {detalhes.peca.desenho_provisorio && (
+                    <p className="aviso-provisorio">⚠️ Documento provisório: o desenho técnico oficial ainda não foi cadastrado.</p>
+                  )}
+                </>
               ) : (
                 <p className="texto-suave">Desenho não cadastrado</p>
               )}

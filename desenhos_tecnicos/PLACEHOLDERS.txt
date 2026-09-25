@@ -1,0 +1,4 @@
+# Codigos de peca cujo PDF em desenhos_tecnicos/ e apenas um aviso provisorio (DESENHO NAO CADASTRADO),
+# nao o desenho tecnico oficial. Um codigo por linha; linhas com # sao comentarios.
+# Quando o desenho oficial substituir o PDF, apague o codigo daqui.
+40-091799
