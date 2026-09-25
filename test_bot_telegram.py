@@ -62,15 +62,117 @@ class TestTextoOrdens:
         assert 'mais 5' in texto
 
 
-class TestTextoFilaProducao:
-    def test_vazia(self):
-        assert 'vazia' in bt.texto_fila_producao({'fila_producao': []})
+ORDEM = {'id': 7, 'numero': 'OS-2026-0007', 'prioridade': 'NORMAL', 'peca_codigo': '40-091799'}
 
-    def test_com_itens(self):
-        texto = bt.texto_fila_producao({'fila_producao': [
-            {'numero': 'OS-1', 'peca_codigo': '40-091799', 'status': 'USINANDO', 'prioridade': 'NORMAL'}
-        ]})
-        assert 'OS-1' in texto and '40-091799' in texto
+
+def _op(id_, seq, status, maquina='Torno Horizontal', planejado=120, maquina_status='DISPONIVEL'):
+    return {'id': id_, 'sequencia': seq, 'status': status, 'maquina_nome': maquina,
+            'maquina_status': maquina_status, 'tempo_planejado_min': planejado}
+
+
+class TestOperacoesDaFila:
+    def test_executando_e_liberada_entram_concluida_e_planejada_nao(self):
+        ops = [_op(1, 1, 'CONCLUIDO'), _op(2, 2, 'LIBERADO'), _op(3, 3, 'PLANEJADO')]
+        itens = bt.operacoes_da_fila(ORDEM, ops)
+        assert [i['alocacao_id'] for i in itens] == [2]
+
+    def test_so_liberada_e_executando_entram_planejada_nao_mesmo_sendo_a_primeira(self):
+        assert bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'PLANEJADO'), _op(2, 2, 'PLANEJADO')]) == []
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO'), _op(2, 2, 'PLANEJADO')])
+        assert [i['alocacao_id'] for i in itens] == [1]
+
+    def test_executando_entra(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'EXECUTANDO')])
+        assert itens[0]['status'] == 'EXECUTANDO' and itens[0]['os_id'] == 7
+
+    def test_carrega_maquina_parada_e_total_de_operacoes(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO', maquina_status='QUEBRADA'), _op(2, 2, 'PLANEJADO')])
+        assert itens[0]['maquina_parada'] is True and itens[0]['total_operacoes'] == 2
+
+
+class TestTextoFilaOperacoes:
+    def test_vazia(self):
+        assert 'vazia' in bt.texto_fila_operacoes([])
+
+    def test_linha_tem_os_sequencia_maquina_e_tempo(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'EXECUTANDO', planejado=150), _op(2, 2, 'PLANEJADO')])
+        texto = bt.texto_fila_operacoes(itens)
+        assert 'OS-2026-0007' in texto and 'OP 1/2' in texto
+        assert 'Torno Horizontal' in texto and '2h30min estimados' in texto and 'EXECUTANDO' in texto
+
+    def test_maquina_parada_e_sinalizada(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO', maquina_status='QUEBRADA')])
+        assert 'máquina parada' in bt.texto_fila_operacoes(itens)
+
+    def test_papel_que_nao_executa_recebe_aviso(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')])
+        assert 'Só operador e coordenador' in bt.texto_fila_operacoes(itens, pode_executar=False)
+
+
+class TestTecladoFila:
+    def _botoes(self, teclado):
+        return [(b.text, b.callback_data) for linha in teclado.inline_keyboard for b in linha]
+
+    def test_iniciar_para_liberada_e_concluir_para_executando(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'CONCLUIDO'), _op(2, 2, 'EXECUTANDO')]) + \
+            bt.operacoes_da_fila({**ORDEM, 'id': 8, 'numero': 'OS-8'}, [_op(9, 1, 'LIBERADO')])
+        botoes = self._botoes(bt.teclado_fila(itens, 'operador'))
+        assert ('✅ Concluir OS-2026-0007 · OP 2', 'op:c:2:7') in botoes
+        assert ('▶️ Iniciar OS-8 · OP 1', 'op:i:9:8') in botoes
+
+    def test_operador_e_coordenador_veem_botoes(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')])
+        assert bt.teclado_fila(itens, 'operador') and bt.teclado_fila(itens, 'coordenador')
+
+    def test_gestor_e_diretor_nao_veem_botoes(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')])
+        assert bt.teclado_fila(itens, 'gestor') is None and bt.teclado_fila(itens, 'diretor') is None
+
+    def test_callback_data_cabe_no_limite_do_telegram(self):
+        itens = bt.operacoes_da_fila({**ORDEM, 'id': 999999}, [_op(999999, 1, 'LIBERADO')])
+        assert all(len(d.encode()) <= 64 for _, d in self._botoes(bt.teclado_fila(itens, 'operador')))
+
+
+class TestTraduzirErroAcao:
+    def test_maquina_parada_vira_mensagem_legivel(self):
+        texto = bt.traduzir_erro_acao('Máquina Serra de Fita está parada')
+        assert 'Serra de Fita' in texto and 'conserto' in texto and 'Erro' not in texto
+
+    def test_permissao_negada(self):
+        assert 'papel não permite' in bt.traduzir_erro_acao('Permissão negada para este papel')
+
+    def test_ja_iniciada_e_ja_concluida(self):
+        assert 'já foi iniciada' in bt.traduzir_erro_acao('Operação já iniciada')
+        assert 'já foi concluída' in bt.traduzir_erro_acao('Operação já concluída')
+
+    def test_operacao_anterior_pendente(self):
+        texto = bt.traduzir_erro_acao('A operação anterior (OP 1) da OS-1 ainda não foi concluída. Conclua-a antes de iniciar a OP 2')
+        assert 'OP 1' in texto and 'Erro' not in texto
+
+    def test_erro_desconhecido_nao_e_engolido(self):
+        assert 'algo inesperado' in bt.traduzir_erro_acao('algo inesperado')
+
+
+class TestTextoConclusao:
+    def test_informa_realizado_planejado_e_proxima(self):
+        ops = [_op(1, 1, 'CONCLUIDO', planejado=120), _op(2, 2, 'LIBERADO', 'Fresadora Universal', 90)]
+        texto = bt.texto_conclusao({'tempo_realizado_min': 130, 'os_concluida': False}, ops, 1)
+        assert 'Realizado: 2h10min' in texto and 'Planejado: 2h00min' in texto
+        assert '10min acima' in texto
+        assert 'OP 2 na Fresadora Universal' in texto
+
+    def test_abaixo_do_planejado(self):
+        texto = bt.texto_conclusao({'tempo_realizado_min': 100, 'os_concluida': False},
+                                   [_op(1, 1, 'CONCLUIDO', planejado=120)], 1)
+        assert '20min abaixo' in texto
+
+    def test_ultima_operacao_conclui_a_os(self):
+        texto = bt.texto_conclusao({'tempo_realizado_min': 60, 'os_concluida': True},
+                                   [_op(1, 1, 'CONCLUIDO', planejado=60)], 1)
+        assert 'OS está concluída' in texto and 'Liberada em seguida' not in texto
+
+    def test_sem_lista_de_operacoes_nao_quebra(self):
+        assert 'concluída' in bt.texto_conclusao({'tempo_realizado_min': 5, 'os_concluida': False}, [], 1)
 
 
 class TestTextoIndicadores:

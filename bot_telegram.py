@@ -1,7 +1,8 @@
 """Bot do Telegram - Sistema de Automação de Usinagem
 Etapa 1: vínculo de conta, menu e consultas de leitura.
-
-Nenhuma ação que muda dado passa por aqui ainda (isso é Etapa 2 em diante).
+Etapa 2: fila de produção e execução de operações (iniciar/concluir), sempre
+com confirmação antes da ação, pelas rotas /api/alocacoes/<id>/iniciar e
+/concluir — a mesma execução que o site faz, com o JWT do usuário.
 
 O bot NÃO tem rotas de domínio próprias e nunca acessa o banco direto: ele
 troca telegram_id (+ o token de serviço deste processo) por um JWT de curta
@@ -23,7 +24,7 @@ import requests
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes)
+                          ContextTypes, MessageHandler, filters)
 
 load_dotenv()
 
@@ -148,14 +149,116 @@ def texto_ordens(ordens, limite=10):
     return '\n'.join(linhas)
 
 
-def texto_fila_producao(dados):
-    fila = dados.get('fila_producao', [])
-    if not fila:
-        return '📋 Fila de produção vazia agora.'
-    linhas = ['📋 Fila de produção (todas as OS em planejamento ou usinando):']
-    for os_ in fila[:10]:
-        marca = '🚨' if os_.get('prioridade') == 'URGENTE' else '•'
-        linhas.append(f"{marca} {os_['numero']} — {os_.get('peca_codigo', '?')} — {os_['status']}")
+PAPEIS_EXECUTAM = ('operador', 'coordenador')  # os mesmos que o backend aceita em /alocacoes/*
+LIMITE_FILA = 10  # o Telegram limita botões por mensagem; a fila vem ordenada por urgência
+
+
+def operacoes_da_fila(ordem, operacoes):
+    """Operações de uma OS que aparecem na fila de produção do bot.
+
+    `ordem` é uma linha de GET /ordens-servico; `operacoes` vem de
+    GET /ordens-servico/<id>/operacoes. Entram as EXECUTANDO e as prontas
+    para iniciar (LIBERADO: o backend marca assim a 1ª operação de toda OS
+    nova e cada seguinte quando a anterior termina)."""
+    itens = []
+    for op in operacoes:
+        if op['status'] not in ('EXECUTANDO', 'LIBERADO'):
+            continue
+        itens.append({
+            'alocacao_id': op['id'], 'os_id': ordem['id'], 'os_numero': ordem['numero'],
+            'prioridade': ordem.get('prioridade'), 'peca_codigo': ordem.get('peca_codigo'),
+            'sequencia': op['sequencia'], 'total_operacoes': len(operacoes),
+            'status': op['status'], 'maquina': op['maquina_nome'],
+            'maquina_parada': op.get('maquina_status') == 'QUEBRADA',
+            'planejado_min': op.get('tempo_planejado_min'),
+        })
+    return itens
+
+
+def texto_duracao(minutos):
+    if minutos is None:
+        return '?'
+    h, m = divmod(max(int(minutos), 0), 60)
+    return f'{h}h{m:02d}min' if h else f'{m}min'
+
+
+def texto_fila_operacoes(itens, pode_executar=True):
+    if not itens:
+        return '📋 Fila de produção vazia: nenhuma operação liberada ou em execução agora.'
+    linhas = ['📋 Fila de produção:']
+    for it in itens[:LIMITE_FILA]:
+        marca = '🚨' if it.get('prioridade') == 'URGENTE' else '•'
+        situacao = '⚙️ EXECUTANDO' if it['status'] == 'EXECUTANDO' else '🟡 LIBERADA'
+        parada = ' 🔴 máquina parada' if it.get('maquina_parada') else ''
+        linhas.append(f"{marca} {it['os_numero']} — OP {it['sequencia']}/{it['total_operacoes']} — "
+                      f"{it['maquina']} — {texto_duracao(it.get('planejado_min'))} estimados — {situacao}{parada}")
+    if len(itens) > LIMITE_FILA:
+        linhas.append(f'\n... e mais {len(itens) - LIMITE_FILA}.')
+    if not pode_executar:
+        linhas.append('\n👁️ Só operador e coordenador iniciam ou concluem operações.')
+    return '\n'.join(linhas)
+
+
+def teclado_fila(itens, role):
+    """Um botão por operação (Iniciar ou Concluir), só para quem executa."""
+    if role not in PAPEIS_EXECUTAM:
+        return None
+    linhas = []
+    for it in itens[:LIMITE_FILA]:
+        acao, rotulo = ('c', '✅ Concluir') if it['status'] == 'EXECUTANDO' else ('i', '▶️ Iniciar')
+        linhas.append([InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
+                                            callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}")])
+    return InlineKeyboardMarkup(linhas) if linhas else None
+
+
+def traduzir_erro_acao(erro):
+    """Mensagem do backend -> texto legível para quem está no chat."""
+    if 'está parada' in erro:
+        return (f'🔴 {erro}. Não dá para iniciar uma operação nela até o conserto ser registrado. '
+                'Fale com a manutenção e tente de novo depois.')
+    if 'Permissão negada' in erro:
+        return '⛔ Seu papel não permite iniciar ou concluir operações.'
+    if 'operação anterior' in erro:
+        return f'⏳ {erro}. Veja a fila atualizada com /fila.'
+    if 'já iniciada' in erro:
+        return 'ℹ️ Essa operação já foi iniciada (talvez por outra pessoa). Veja a fila atualizada com /fila.'
+    if 'já concluída' in erro:
+        return 'ℹ️ Essa operação já foi concluída. Veja a fila atualizada com /fila.'
+    if 'ainda não foi iniciada' in erro:
+        return 'ℹ️ Essa operação ainda não foi iniciada, então não dá para concluir. Veja /fila.'
+    if 'não encontrada' in erro:
+        return 'ℹ️ Não encontrei essa operação. Veja a fila atualizada com /fila.'
+    return f'❌ {erro}'
+
+
+def texto_conclusao(resultado, operacoes, alocacao_id):
+    """Resposta de POST /alocacoes/<id>/concluir + GET .../operacoes -> texto.
+
+    Planejado e a operação liberada em seguida não vêm na resposta de
+    concluir; saem da lista de operações da mesma OS."""
+    atual = next((o for o in operacoes if o['id'] == alocacao_id), None)
+    seq = atual['sequencia'] if atual else None
+    realizado = resultado.get('tempo_realizado_min')
+    planejado = atual.get('tempo_planejado_min') if atual else None
+
+    linhas = [f"✅ OP {seq if seq is not None else '?'} concluída."]
+    linhas.append(f'⏱️ Realizado: {texto_duracao(realizado)} | Planejado: {texto_duracao(planejado)}')
+    if realizado is not None and planejado is not None:
+        desvio = realizado - planejado
+        if desvio > 0:
+            linhas.append(f'   ({texto_duracao(desvio)} acima do planejado)')
+        elif desvio < 0:
+            linhas.append(f'   ({texto_duracao(-desvio)} abaixo do planejado)')
+        else:
+            linhas.append('   (exatamente o planejado)')
+
+    if resultado.get('os_concluida'):
+        linhas.append('🏁 Era a última operação: a OS está concluída.')
+    else:
+        prox = next((o for o in operacoes if seq is not None and o['sequencia'] == seq + 1), None)
+        if prox:
+            linhas.append(f"➡️ Liberada em seguida: OP {prox['sequencia']} na {prox['maquina_nome']} "
+                          f"({texto_duracao(prox.get('tempo_planejado_min'))} estimados).")
     return '\n'.join(linhas)
 
 
@@ -180,6 +283,7 @@ TEXTO_AJUDA = (
     '/menu — opções disponíveis para o seu papel\n'
     '/maquinas — situação das 8 máquinas\n'
     '/os — ordens de serviço pendentes\n'
+    '/fila — fila de produção: iniciar e concluir operações (operador e coordenador)\n'
     '/desenho <código> — desenho técnico da peça (PDF)\n'
     '/indicadores — disponibilidade e MTTR (coordenador, gestor, diretor)\n'
     '/ajuda — esta mensagem'
@@ -282,10 +386,162 @@ async def ordens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(erro or texto_ordens(dados))
 
 
+def montar_fila(telegram_id):
+    """(itens, erro): operações liberadas/executando de todas as OS abertas.
+    Só rotas existentes: lista de OS + operações de cada uma (a lista de OS
+    abertas é pequena; a ordem de urgência já vem do backend)."""
+    ordens_, erro = chamar_api(telegram_id, 'GET', '/ordens-servico')
+    if erro:
+        return None, erro
+    itens = []
+    for ordem in ordens_:
+        if ordem.get('status') == 'CONCLUIDA':
+            continue
+        ops, erro = chamar_api(telegram_id, 'GET', f"/ordens-servico/{ordem['id']}/operacoes")
+        if erro:
+            return None, erro
+        itens.extend(operacoes_da_fila(ordem, ops))
+    return itens, None
+
+
+def _fila_pronta(telegram_id):
+    """(texto, teclado) da fila para este usuário; o texto já é o erro se falhar."""
+    _token, role, _email = obter_sessao(telegram_id)
+    itens, erro = montar_fila(telegram_id)
+    if erro:
+        return erro, None
+    return texto_fila_operacoes(itens, pode_executar=role in PAPEIS_EXECUTAM), teclado_fila(itens, role)
+
+
 async def fila(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('obs_pendente', None)
+    texto, teclado = _fila_pronta(update.effective_user.id)
+    await update.message.reply_text(texto, reply_markup=teclado)
+
+
+# --- Ações sobre operações (Etapa 2) -----------------------------------------
+# Fluxo: botão -> [Confirmar]/[Cancelar] -> (só concluir) observação -> ação.
+# callback_data: op:<acao>:<alocacao_id>:<os_id>, com acao = i/ic (iniciar,
+# confirmar), c/cc (concluir, confirmar), cs (concluir sem observação), x.
+
+OBS_VALIDADE_MIN = 10
+OBS_MAX_CHARS = 500
+
+
+def _teclado_confirmar(acao_confirmar, aid, os_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('✅ Confirmar', callback_data=f'op:{acao_confirmar}:{aid}:{os_id}'),
+        InlineKeyboardButton('❌ Cancelar', callback_data='op:x:0:0'),
+    ]])
+
+
+def _buscar_operacao(telegram_id, os_id, aid):
+    """(operacao, todas, erro) com o estado ATUAL da operação no backend."""
+    ops, erro = chamar_api(telegram_id, 'GET', f'/ordens-servico/{os_id}/operacoes')
+    if erro:
+        return None, None, erro
+    op = next((o for o in ops if o['id'] == aid), None)
+    if not op:
+        return None, ops, 'Operação não encontrada'
+    return op, ops, None
+
+
+async def _executar_iniciar(query, telegram_id, aid, os_id):
+    dados, erro = chamar_api(telegram_id, 'POST', f'/alocacoes/{aid}/iniciar')
+    if erro:
+        await query.edit_message_text(traduzir_erro_acao(erro))
+        return
+    hora = (dados.get('inicio_real') or '')[11:16]
+    await query.edit_message_text(f"▶️ Operação iniciada{f' às {hora}' if hora else ''}. Bom trabalho!\n"
+                                  'Quando terminar, use /fila e toque em Concluir.')
+
+
+async def _executar_concluir(responder, telegram_id, aid, os_id, observacao):
+    """`responder` = função async (texto) que edita ou envia a mensagem."""
+    dados, erro = chamar_api(telegram_id, 'POST', f'/alocacoes/{aid}/concluir',
+                             json={'observacao': observacao or ''})
+    if erro:
+        await responder(traduzir_erro_acao(erro))
+        return
+    ops, erro_ops = chamar_api(telegram_id, 'GET', f'/ordens-servico/{os_id}/operacoes')
+    await responder(texto_conclusao(dados, ops or [], aid))
+
+
+async def acao_operacao(update: Update, context: ContextTypes.DEFAULT_TYPE, query, dados_cb):
     telegram_id = update.effective_user.id
-    dados, erro = chamar_api(telegram_id, 'GET', '/painel/operador')
-    await update.message.reply_text(erro or texto_fila_producao(dados))
+    try:
+        _, acao, aid, os_id = dados_cb.split(':')
+        aid, os_id = int(aid), int(os_id)
+    except ValueError:
+        await query.edit_message_text('Opção não reconhecida.')
+        return
+
+    if acao == 'x':
+        context.user_data.pop('obs_pendente', None)
+        await query.edit_message_text('Cancelado. Nada foi alterado. /fila mostra a fila de novo.')
+        return
+
+    role, resultado = _requer_vinculo(telegram_id)
+    if not role:
+        await query.edit_message_text(resultado)
+        return
+    if role not in PAPEIS_EXECUTAM:
+        await query.edit_message_text(traduzir_erro_acao('Permissão negada para este papel'))
+        return
+
+    if acao in ('i', 'c'):  # pede confirmação, já com o estado atual da operação
+        op, _ops, erro = _buscar_operacao(telegram_id, os_id, aid)
+        if erro:
+            await query.edit_message_text(traduzir_erro_acao(erro))
+            return
+        if acao == 'i' and op['status'] == 'EXECUTANDO':
+            await query.edit_message_text(traduzir_erro_acao('Operação já iniciada'))
+            return
+        if acao == 'c' and op['status'] != 'EXECUTANDO':
+            await query.edit_message_text(traduzir_erro_acao(
+                'Operação já concluída' if op['status'] == 'CONCLUIDO' else 'Operação ainda não foi iniciada'))
+            return
+        verbo = 'Iniciar' if acao == 'i' else 'Concluir'
+        await query.edit_message_text(
+            f"{verbo} a OP {op['sequencia']} na {op['maquina_nome']}?\n"
+            f"Estimado: {texto_duracao(op.get('tempo_planejado_min'))}",
+            reply_markup=_teclado_confirmar('ic' if acao == 'i' else 'cc', aid, os_id))
+        return
+
+    if acao == 'ic':
+        await _executar_iniciar(query, telegram_id, aid, os_id)
+        return
+
+    if acao == 'cc':  # confirmado: agora pergunta a observação antes de concluir
+        context.user_data['obs_pendente'] = {'aid': aid, 'os_id': os_id, 'ate': datetime.now() + timedelta(minutes=OBS_VALIDADE_MIN)}
+        await query.edit_message_text(
+            '📝 Quer registrar alguma observação sobre esta operação?\n'
+            'Escreva a mensagem agora, ou toque em [Sem observação].',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('Sem observação', callback_data=f'op:cs:{aid}:{os_id}'),
+                InlineKeyboardButton('❌ Cancelar', callback_data='op:x:0:0'),
+            ]]))
+        return
+
+    if acao == 'cs':
+        context.user_data.pop('obs_pendente', None)
+        await _executar_concluir(query.edit_message_text, telegram_id, aid, os_id, '')
+        return
+
+    await query.edit_message_text('Opção não reconhecida.')
+
+
+async def texto_livre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Texto solto: só faz algo quando há uma observação sendo esperada."""
+    pendente = context.user_data.get('obs_pendente')
+    if not pendente or pendente['ate'] < datetime.now():
+        context.user_data.pop('obs_pendente', None)
+        await update.message.reply_text('Não entendi. Use /menu para ver as opções.')
+        return
+    context.user_data.pop('obs_pendente', None)
+    observacao = update.message.text.strip()[:OBS_MAX_CHARS]
+    await _executar_concluir(update.message.reply_text, update.effective_user.id,
+                             pendente['aid'], pendente['os_id'], observacao)
 
 
 async def indicadores(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,12 +594,10 @@ async def desenho(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ACOES_MENU = {
     'maquinas': lambda telegram_id: chamar_api(telegram_id, 'GET', '/maquinas'),
     'os': lambda telegram_id: chamar_api(telegram_id, 'GET', '/ordens-servico'),
-    'fila': lambda telegram_id: chamar_api(telegram_id, 'GET', '/painel/operador'),
 }
 FORMATADORES_MENU = {
     'maquinas': texto_maquinas,
     'os': texto_ordens,
-    'fila': texto_fila_producao,
 }
 
 
@@ -355,6 +609,16 @@ async def botao_pressionado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if acao == 'ajuda':
         await query.edit_message_text(TEXTO_AJUDA)
+        return
+
+    if acao.startswith('op:'):
+        await acao_operacao(update, context, query, acao)
+        return
+
+    if acao == 'fila':
+        context.user_data.pop('obs_pendente', None)
+        texto, teclado = _fila_pronta(telegram_id)
+        await query.edit_message_text(texto, reply_markup=teclado)
         return
 
     if acao == 'indicadores':
@@ -401,12 +665,13 @@ def main():
     app.add_handler(CommandHandler('menu', menu))
     app.add_handler(CommandHandler('maquinas', maquinas))
     app.add_handler(CommandHandler('os', ordens))
-    app.add_handler(CommandHandler('minhas', fila))
+    app.add_handler(CommandHandler(['fila', 'minhas'], fila))
     app.add_handler(CommandHandler('indicadores', indicadores))
     app.add_handler(CommandHandler('desenho', desenho))
     app.add_handler(CallbackQueryHandler(botao_pressionado))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texto_livre))
 
-    logger.info(f'Bot iniciado (Etapa 1). Backend alvo: {BOT_BACKEND_URL}')
+    logger.info(f'Bot iniciado (Etapa 2). Backend alvo: {BOT_BACKEND_URL}')
     app.run_polling()
 
 

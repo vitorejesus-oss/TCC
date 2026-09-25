@@ -364,6 +364,13 @@ def init_db():
         bloqueado_ate TIMESTAMP
     )''')
 
+    # Migração: LIBERADO passou a significar "pode começar", e a 1ª operação
+    # nasce assim (ver processar_nota). Operações de sequência 1 já gravadas
+    # como PLANEJADO, em OS ainda não iniciadas, passam a LIBERADO. Idempotente.
+    c.execute('''UPDATE alocacao_maquinas SET status = 'LIBERADO'
+                 WHERE sequencia = 1 AND status = 'PLANEJADO' AND inicio_real IS NULL
+                   AND ordem_servico_id IN (SELECT id FROM ordens_servico WHERE status = 'PLANEJAMENTO')''')
+
     conn.commit()
     logger.info("Banco de dados inicializado")
     conn.close()
@@ -1211,7 +1218,10 @@ class AutomacaoUsinagem:
                             (ordem_servico_id, maquina_id, sequencia, status,
                              inicio_planejado, fim_planejado, tempo_planejado_min)
                             VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                         (os_id, maquina[0], op['sequencia'], 'PLANEJADO',
+                         (os_id, maquina[0], op['sequencia'],
+                          # LIBERADO = "pode começar": só a 1ª operação nasce assim;
+                          # as demais são liberadas quando a anterior é concluída.
+                          'LIBERADO' if op['sequencia'] == 1 else 'PLANEJADO',
                           tempo_inicio.isoformat(), tempo_fim.isoformat(),
                           op['tempo_estimado']))
 
@@ -1945,6 +1955,16 @@ def iniciar_alocacao(alocacao_id):
             return jsonify({'erro': 'Operação não encontrada'}), 404
         if aloc['inicio_real']:
             return jsonify({'erro': 'Operação já iniciada'}), 400
+        # Sequência de fabricação: só começa depois que a anterior terminou.
+        if aloc['sequencia'] > 1:
+            anterior = c.execute('''SELECT status FROM alocacao_maquinas
+                                    WHERE ordem_servico_id = ? AND sequencia = ?''',
+                                 (aloc['ordem_servico_id'], aloc['sequencia'] - 1)).fetchone()
+            if anterior and anterior['status'] != 'CONCLUIDO':
+                return jsonify({
+                    'erro': f"A operação anterior (OP {aloc['sequencia'] - 1}) da {aloc['os_numero']} "
+                            f"ainda não foi concluída. Conclua-a antes de iniciar a OP {aloc['sequencia']}"
+                }), 409
         if aloc['maquina_status'] == 'QUEBRADA':
             return jsonify({
                 'erro': f"Máquina {aloc['maquina_nome']} está parada"
@@ -1954,6 +1974,13 @@ def iniciar_alocacao(alocacao_id):
         c.execute('''UPDATE alocacao_maquinas
                      SET status = 'EXECUTANDO', inicio_real = ?, operador = ?
                      WHERE id = ?''', (agora, email, alocacao_id))
+        # Iniciar a 1ª operação é iniciar a OS (o que /ordens-servico/<id>/iniciar
+        # já faz): sem isto a OS ficava em PLANEJAMENTO com a operação rodando.
+        if aloc['sequencia'] == 1:
+            c.execute('''UPDATE ordens_servico
+                         SET status = 'USINANDO', tempo_inicio = COALESCE(tempo_inicio, ?)
+                         WHERE id = ? AND status = 'PLANEJAMENTO' ''',
+                      (agora, aloc['ordem_servico_id']))
         conn.commit()
 
         registrar_auditoria(

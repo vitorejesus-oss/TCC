@@ -377,6 +377,18 @@ class TestPermissoesEtapa0Bot:
                         data=json.dumps({}), content_type='application/json')
         assert r.status_code == 200, r.data
 
+    def test_iniciar_primeira_operacao_poe_a_os_em_usinando(self, client):
+        """Etapa 2 do bot inicia por /alocacoes: a OS não pode ficar em PLANEJAMENTO."""
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        headers = {'Authorization': f'Bearer {self._token(client, "operador")}'}
+        assert json.loads(client.get(f'/api/ordens-servico/{os_id}').data)['status'] == 'PLANEJAMENTO'
+        assert client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=headers).status_code == 200
+        os_ = json.loads(client.get(f'/api/ordens-servico/{os_id}').data)
+        assert os_['status'] == 'USINANDO' and os_['tempo_inicio']
+
     @pytest.mark.parametrize('papel', ['gestor', 'diretor'])
     def test_gestor_e_diretor_nao_reportam_quebra(self, client, papel):
         maquina_id = self._maquina_id(client)
@@ -717,6 +729,84 @@ class TestEstatisticas:
         assert 'desempenho_por_maquina' in data
         assert 'notas_por_operador' in data
         assert 'economia_semanal' in data
+
+
+class TestLiberadoESequencia:
+    """LIBERADO = "pode começar" em qualquer canal; a sequência de fabricação
+    é regra do servidor (a operação N só inicia com a N-1 CONCLUIDO)."""
+
+    @staticmethod
+    def _nova_os(client):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        return os_id, json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+
+    def test_primeira_operacao_nasce_liberada_e_as_demais_planejadas(self, client):
+        _, ops = self._nova_os(client)
+        assert len(ops) >= 2
+        assert ops[0]['status'] == 'LIBERADO'
+        assert all(o['status'] == 'PLANEJADO' for o in ops[1:])
+
+    def test_botao_iniciar_do_site_continua_funcionando(self, client):
+        os_id, ops = self._nova_os(client)
+        r = client.post(f'/api/ordens-servico/{os_id}/iniciar', headers=_auth_papel(client, 'operador'))
+        assert r.status_code == 200, r.data
+        depois = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        assert depois[0]['status'] == 'EXECUTANDO' and depois[1]['status'] == 'PLANEJADO'
+        assert json.loads(client.get(f'/api/ordens-servico/{os_id}').data)['status'] == 'USINANDO'
+
+    def test_nao_inicia_operacao_com_a_anterior_pendente(self, client):
+        os_id, ops = self._nova_os(client)
+        h = _auth_papel(client, 'operador')
+        r = client.post(f'/api/alocacoes/{ops[1]["id"]}/iniciar', headers=h)
+        assert r.status_code == 409
+        erro = json.loads(r.data)['erro']
+        assert 'operação anterior' in erro and 'OP 1' in erro and 'não foi concluída' in erro
+        # nada mudou: a OP 2 continua PLANEJADO e sem início
+        depois = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        assert depois[1]['status'] == 'PLANEJADO' and depois[1]['inicio_real'] is None
+
+    def test_anterior_em_execucao_tambem_bloqueia(self, client):
+        _, ops = self._nova_os(client)
+        h = _auth_papel(client, 'operador')
+        assert client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=h).status_code == 200
+        assert client.post(f'/api/alocacoes/{ops[1]["id"]}/iniciar', headers=h).status_code == 409
+
+    def test_inicia_depois_que_a_anterior_conclui(self, client):
+        _, ops = self._nova_os(client)
+        h = _auth_papel(client, 'operador')
+        assert client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=h).status_code == 200
+        assert client.post(f'/api/alocacoes/{ops[0]["id"]}/concluir', headers=h,
+                           data=json.dumps({}), content_type='application/json').status_code == 200
+        assert client.post(f'/api/alocacoes/{ops[1]["id"]}/iniciar', headers=h).status_code == 200
+
+    def test_migracao_liberada_so_atinge_seq1_de_os_nao_iniciada(self, client):
+        os_id, ops = self._nova_os(client)
+        conn = app_module.get_db()
+        try:
+            conn.execute("UPDATE alocacao_maquinas SET status='PLANEJADO' WHERE id=?", (ops[0]['id'],))
+            conn.commit()
+            app_module.init_db()
+            status = {r['id']: r['status'] for r in conn.execute(
+                'SELECT id, status FROM alocacao_maquinas WHERE ordem_servico_id = ?', (os_id,))}
+            assert status[ops[0]['id']] == 'LIBERADO'
+            assert status[ops[1]['id']] == 'PLANEJADO'
+        finally:
+            conn.close()
+
+    def test_migracao_nao_toca_os_ja_iniciada(self, client):
+        os_id, ops = self._nova_os(client)
+        h = _auth_papel(client, 'operador')
+        assert client.post(f'/api/ordens-servico/{os_id}/iniciar', headers=h).status_code == 200
+        conn = app_module.get_db()
+        try:
+            conn.execute("UPDATE alocacao_maquinas SET status='PLANEJADO', inicio_real=NULL WHERE id=?", (ops[0]['id'],))
+            conn.commit()
+            app_module.init_db()  # a OS está USINANDO: fora do alcance da migração
+            assert conn.execute('SELECT status FROM alocacao_maquinas WHERE id=?', (ops[0]['id'],)).fetchone()[0] == 'PLANEJADO'
+        finally:
+            conn.close()
 
 
 class TestPermissoesIndicadores:
