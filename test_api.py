@@ -5,6 +5,7 @@ Pytest coverage dos endpoints principais e dos diferenciais
 
 import io
 import json
+import os
 from datetime import date, datetime
 
 import pytest
@@ -1173,3 +1174,224 @@ class TestFeriados:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
+
+
+class TestFichaTecnicaDaPeca:
+    """pecas ganhou material/dimensoes/tolerancia/aplicacao/observacoes_tecnicas (opcionais)."""
+
+    def _lista(self, client):
+        return json.loads(client.get('/api/pecas').data)
+
+    def test_colunas_da_ficha_existem_e_sao_opcionais(self, client):
+        conn = app_module.get_db()
+        try:
+            colunas = {r[1] for r in conn.execute('PRAGMA table_info(pecas)')}
+        finally:
+            conn.close()
+        assert set(app_module.FICHA_CAMPOS) <= colunas
+
+    def test_lista_de_pecas_informa_o_que_falta(self, client):
+        for p in self._lista(client):
+            assert isinstance(p['tem_desenho'], bool)
+            assert set(p['ficha']) | set(p['ficha_faltando']) == set(app_module.FICHA_CAMPOS)
+            assert not set(p['ficha']) & set(p['ficha_faltando'])
+
+    def test_campo_vazio_nao_aparece_na_ficha(self, client):
+        conn = app_module.get_db()
+        try:
+            conn.execute("INSERT OR REPLACE INTO pecas (codigo, nome, material, dimensoes) "
+                         "VALUES ('FICHA-T1', 'Peça ficha', 'Aço 1045', '   ')")
+            conn.commit()
+            p = next(x for x in self._lista(client) if x['codigo'] == 'FICHA-T1')
+            assert p['ficha'] == {'material': 'Aço 1045'}   # '   ' não conta como preenchido
+            assert 'dimensoes' in p['ficha_faltando'] and 'material' not in p['ficha_faltando']
+            assert p['tem_desenho'] is False
+        finally:
+            conn.execute("DELETE FROM pecas WHERE codigo = 'FICHA-T1'")
+            conn.commit()
+            conn.close()
+
+    def test_peca_com_pdf_tem_desenho(self, client):
+        com = [p for p in self._lista(client) if p['tem_desenho']]
+        assert com and all(os.path.isfile(os.path.join(app_module.DESENHOS_DIR, p['codigo'] + '.pdf')) for p in com)
+
+    def test_detalhes_da_nota_trazem_ficha_e_desenho(self, client):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        nota_id = json.loads(r.data)['nota_id']
+        det = json.loads(client.get(f'/api/notas/{nota_id}/detalhes', headers=_auth_papel(client, 'operador')).data)
+        assert det['peca']['tem_desenho'] is True
+        assert set(det['peca']['ficha']) | set(det['peca']['ficha_faltando']) == set(app_module.FICHA_CAMPOS)
+
+
+class TestBuscaDeOS:
+    """GET /api/ordens-servico com filtros combináveis, ordenação e paginação."""
+
+    @staticmethod
+    def _tag():
+        import uuid
+        return 'BUSCA-' + uuid.uuid4().hex[:10]
+
+    @staticmethod
+    def _criar(client, tag, prioridade='NORMAL'):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1,
+                                                        'solicitante': tag, 'prioridade': prioridade}),
+                        content_type='application/json')
+        d = json.loads(r.data)
+        return d['processamento']['os_id'], d['nota_id']
+
+    @staticmethod
+    def _buscar(client, **params):
+        r = client.get('/api/ordens-servico', query_string=params)
+        return r, (json.loads(r.data) if r.status_code == 200 else None)
+
+    @staticmethod
+    def _sql(sql, *params):
+        conn = app_module.get_db()
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_sem_parametros_continua_devolvendo_lista_simples(self, client):
+        r, data = self._buscar(client)
+        assert r.status_code == 200 and isinstance(data, list)
+        assert {'numero', 'peca_nome', 'peca_codigo', 'status'} <= set(data[0])
+
+    def test_texto_livre_acha_por_solicitante_numero_da_os_da_nota_peca(self, client):
+        tag = self._tag()
+        os_id, nota_id = self._criar(client, tag)
+        _, por_solicitante = self._buscar(client, q=tag.lower())      # sem diferenciar maiúscula
+        assert [o['id'] for o in por_solicitante] == [os_id]
+        o = por_solicitante[0]
+        for termo in (o['numero'], o['nota_numero'], o['peca_codigo'], o['peca_nome'][:5]):
+            _, d = self._buscar(client, q=termo)
+            assert os_id in [x['id'] for x in d], termo
+
+    def test_texto_livre_trata_percentual_e_underscore_como_texto(self, client):
+        assert self._buscar(client, q='%')[1] == []
+        assert self._buscar(client, q='_')[1] == []
+
+    def test_prioridade_e_status(self, client):
+        tag = self._tag()
+        u, _ = self._criar(client, tag, 'URGENTE')
+        n, _ = self._criar(client, tag, 'NORMAL')
+        assert [o['id'] for o in self._buscar(client, q=tag, prioridade='URGENTE')[1]] == [u]
+        assert [o['id'] for o in self._buscar(client, q=tag, prioridade='normal')[1]] == [n]
+        self._sql("UPDATE ordens_servico SET status='USINANDO' WHERE id=?", u)
+        assert [o['id'] for o in self._buscar(client, q=tag, status='USINANDO')[1]] == [u]
+        assert [o['id'] for o in self._buscar(client, q=tag, status='PLANEJAMENTO')[1]] == [n]
+        assert self._buscar(client, q=tag, status='CONCLUIDA')[1] == []
+
+    def test_filtro_por_maquina(self, client):
+        tag = self._tag()
+        os_id, _ = self._criar(client, tag)
+        maquinas = json.loads(client.get('/api/maquinas').data)
+        usada = next(m for m in maquinas if m['nome'] == 'Torno Horizontal')   # roteiro da peça 40-091799
+        fora = next(m for m in maquinas if m['nome'] == 'Serra de Fita')
+        assert [o['id'] for o in self._buscar(client, q=tag, maquina_id=usada['id'])[1]] == [os_id]
+        assert self._buscar(client, q=tag, maquina_id=fora['id'])[1] == []
+
+    def test_periodo_de_criacao_e_de_conclusao(self, client):
+        tag = self._tag()
+        os_id, _ = self._criar(client, tag)
+        self._sql("UPDATE ordens_servico SET criada_em='2031-03-10T12:00:00', concluida_em='2031-03-12 09:30:00', "
+                  "status='CONCLUIDA' WHERE id=?", os_id)
+        achou = lambda **p: os_id in [o['id'] for o in self._buscar(client, q=tag, **p)[1]]
+        assert achou(criada_de='2031-03-10', criada_ate='2031-03-10')          # limites inclusivos
+        assert not achou(criada_de='2031-03-11')
+        assert not achou(criada_ate='2031-03-09')
+        assert achou(concluida_de='2031-03-12', concluida_ate='2031-03-12')   # formato antigo (espaço) também
+        assert not achou(concluida_de='2031-03-13')
+
+    def test_operador_que_executou(self, client):
+        tag = self._tag()
+        os_id, _ = self._criar(client, tag)
+        outra, _ = self._criar(client, tag)
+        self._sql("UPDATE alocacao_maquinas SET operador='fulano.busca@fabrica.com' WHERE ordem_servico_id=? AND sequencia=1", os_id)
+        assert [o['id'] for o in self._buscar(client, q=tag, operador='fulano.busca')[1]] == [os_id]
+        assert 'fulano.busca@fabrica.com' in self._buscar(client, q=tag, operador='fulano.busca')[1][0]['operadores']
+        assert self._buscar(client, q=tag, operador='ninguem.assim')[1] == []
+
+    def test_em_atraso_so_operacao_aberta_com_fim_planejado_passado(self, client):
+        tag = self._tag()
+        atrasada, _ = self._criar(client, tag)
+        no_prazo, _ = self._criar(client, tag)
+        concluida, _ = self._criar(client, tag)
+        self._sql("UPDATE alocacao_maquinas SET fim_planejado='2020-01-01T10:00:00' WHERE ordem_servico_id=?", atrasada)
+        self._sql("UPDATE alocacao_maquinas SET fim_planejado='2099-01-01T10:00:00' WHERE ordem_servico_id=?", no_prazo)
+        self._sql("UPDATE alocacao_maquinas SET fim_planejado='2020-01-01T10:00:00' WHERE ordem_servico_id=?", concluida)
+        self._sql("UPDATE ordens_servico SET status='CONCLUIDA' WHERE id=?", concluida)
+        _, atrasos = self._buscar(client, q=tag, em_atraso='1')
+        assert [o['id'] for o in atrasos] == [atrasada]
+        assert atrasos[0]['em_atraso'] is True and atrasos[0]['atraso_min'] > 60 * 24 * 365
+        _, todas = self._buscar(client, q=tag)
+        por_id = {o['id']: o for o in todas}
+        assert por_id[no_prazo]['em_atraso'] is False and por_id[no_prazo]['atraso_min'] is None
+        assert por_id[concluida]['em_atraso'] is False
+
+    def test_operacao_concluida_no_prazo_nao_e_atraso(self, client):
+        tag = self._tag()
+        os_id, _ = self._criar(client, tag)
+        self._sql("UPDATE alocacao_maquinas SET fim_planejado='2020-01-01T10:00:00', status='CONCLUIDO' "
+                  "WHERE ordem_servico_id=? AND sequencia=1", os_id)
+        self._sql("UPDATE alocacao_maquinas SET fim_planejado='2099-01-01T10:00:00' WHERE ordem_servico_id=? AND sequencia>1", os_id)
+        assert self._buscar(client, q=tag, em_atraso='1')[1] == []
+
+    def test_planejado_realizado_e_maquina_atual(self, client):
+        tag = self._tag()
+        os_id, _ = self._criar(client, tag)
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        linha = self._buscar(client, q=tag)[1][0]
+        assert linha['planejado_min'] == sum(o['tempo_planejado_min'] for o in ops)
+        assert linha['realizado_min'] is None
+        assert linha['maquina_atual'] == ops[0]['maquina_nome']           # a LIBERADO
+        h = _auth_papel(client, 'operador')
+        client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=h)
+        client.post(f'/api/alocacoes/{ops[0]["id"]}/concluir', headers=h, data=json.dumps({}), content_type='application/json')
+        self._sql("UPDATE alocacao_maquinas SET tempo_realizado_min=130 WHERE id=?", ops[0]['id'])
+        linha = self._buscar(client, q=tag)[1][0]
+        assert linha['realizado_min'] == 130
+        assert linha['maquina_atual'] == ops[1]['maquina_nome']           # a seguinte foi liberada
+
+    def test_filtros_combinam(self, client):
+        tag = self._tag()
+        u, _ = self._criar(client, tag, 'URGENTE')
+        self._criar(client, tag, 'NORMAL')
+        assert [o['id'] for o in self._buscar(client, q=tag, prioridade='URGENTE', status='PLANEJAMENTO')[1]] == [u]
+        assert self._buscar(client, q=tag, prioridade='URGENTE', status='CONCLUIDA')[1] == []
+
+    def test_paginacao(self, client):
+        tag = self._tag()
+        ids = [self._criar(client, tag)[0] for _ in range(5)]
+        r, p1 = self._buscar(client, q=tag, pagina=1, por_pagina=2, ordenar='numero', direcao='asc')
+        assert set(p1) == {'itens', 'total', 'pagina', 'por_pagina', 'paginas'}
+        assert p1['total'] == 5 and p1['paginas'] == 3 and len(p1['itens']) == 2
+        _, p3 = self._buscar(client, q=tag, pagina=3, por_pagina=2, ordenar='numero', direcao='asc')
+        assert len(p3['itens']) == 1
+        _, p4 = self._buscar(client, q=tag, pagina=4, por_pagina=2, ordenar='numero')
+        assert p4['itens'] == []
+        vistos = [o['id'] for pg in (1, 2, 3) for o in self._buscar(client, q=tag, pagina=pg, por_pagina=2, ordenar='numero')[1]['itens']]
+        assert sorted(vistos) == sorted(ids) and len(set(vistos)) == 5   # sem repetir nem perder
+
+    def test_ordenacao_asc_e_desc(self, client):
+        tag = self._tag()
+        for _ in range(3):
+            self._criar(client, tag)
+        asc = [o['numero'] for o in self._buscar(client, q=tag, ordenar='numero', direcao='asc')[1]]
+        desc = [o['numero'] for o in self._buscar(client, q=tag, ordenar='numero', direcao='desc')[1]]
+        assert asc == sorted(asc) and desc == list(reversed(asc))
+
+    def test_parametros_invalidos_retornam_400(self, client):
+        for params in ({'status': 'XYZ'}, {'prioridade': 'XYZ'}, {'criada_de': '10/03/2031'},
+                       {'concluida_ate': 'ontem'}, {'ordenar': 'senha'}, {'direcao': 'cima'},
+                       {'pagina': '0'}, {'pagina': 'abc'}, {'por_pagina': '1000'}, {'maquina_id': 'x'},
+                       {'origem': 'INVENTADA'}):
+            r, _ = self._buscar(client, **params)
+            assert r.status_code == 400, params
+
+    def test_ordenar_nao_aceita_sql(self, client):
+        r, _ = self._buscar(client, ordenar='os.id; DROP TABLE ordens_servico')
+        assert r.status_code == 400
+        assert self._buscar(client)[0].status_code == 200

@@ -2,6 +2,8 @@
 
 Formato: separador ';', uma linha por operação, com o cabeçalho
     codigo;nome;sequencia;maquina;tempo_estimado_min;descricao
+e, opcionalmente, as colunas da ficha técnica da peça
+    material;dimensoes;tolerancia;aplicacao;observacoes_tecnicas
 Veja o modelo_pecas.csv. O CSV do Excel em português (";") e o "CSV UTF-8"
 são lidos.
 
@@ -14,7 +16,11 @@ errado. Só é aceita se
   - o nome é o mesmo em todas as linhas da peça.
 
 Peça que já existe tem o nome e o roteiro SUBSTITUÍDOS pelos do arquivo (as
-sequências que sumiram são apagadas). Notas e OS já criadas não mudam: o
+sequências que sumiram são apagadas). A ficha técnica é da peça, não da
+operação: basta preencher numa linha da peça (se preenchida em mais de uma,
+o valor tem que ser o mesmo). Campo da ficha vazio no arquivo NÃO apaga o que
+já está cadastrado; só o que vem preenchido é gravado. O sistema não gera
+medidas: quem preenche é quem tem o desenho em mãos. Notas e OS já criadas não mudam: o
 planejado delas ficou gravado. Peça nova entra sem descricao própria (o CSV
 só traz a descrição de cada operação). Tudo o que é aceito entra numa
 transação só, e cada peça criada ou atualizada vira um evento na auditoria.
@@ -34,7 +40,8 @@ from collections import OrderedDict, defaultdict
 
 from app import get_db, registrar_auditoria
 
-COLUNAS = ('codigo', 'nome', 'sequencia', 'maquina', 'tempo_estimado_min', 'descricao')
+FICHA = ('material', 'dimensoes', 'tolerancia', 'aplicacao', 'observacoes_tecnicas')
+COLUNAS = ('codigo', 'nome', 'sequencia', 'maquina', 'tempo_estimado_min', 'descricao') + FICHA
 OBRIGATORIAS = COLUNAS[:5]
 SEM_MUDANCAS = 'sem mudanças'
 
@@ -132,6 +139,7 @@ def validar(linhas, maquinas):
     for codigo, itens in grupos.items():
         motivos, avisos, ops = [], [], []
         nomes = OrderedDict()
+        ficha = {campo: OrderedDict() for campo in FICHA}   # campo -> {valor: [linhas]}
         sequencias = []                 # (sequencia, linha) de toda linha com sequência válida
         sequencia_invalida = False
 
@@ -148,6 +156,10 @@ def validar(linhas, maquinas):
                 recusar('nome vazio')
             else:
                 nomes.setdefault(l['nome'], []).append(numero)
+
+            for campo in FICHA:
+                if l.get(campo):
+                    ficha[campo].setdefault(l[campo], []).append(numero)
 
             seq = _inteiro(l.get('sequencia'))
             if seq is None:
@@ -182,6 +194,11 @@ def validar(linhas, maquinas):
                       for n, v in nomes.items()]
             motivos.append('nome diferente entre as linhas: ' + ' e '.join(partes))
 
+        for campo, valores in ficha.items():
+            if len(valores) > 1:
+                partes = [f"'{v}' (linha{'s' if len(n) > 1 else ''} {', '.join(map(str, n))})" for v, n in valores.items()]
+                motivos.append(f'{campo} diferente entre as linhas: ' + ' e '.join(partes))
+
         por_sequencia = defaultdict(list)
         for seq, numero in sequencias:
             por_sequencia[seq].append(numero)
@@ -198,6 +215,7 @@ def validar(linhas, maquinas):
             recusadas.append({'codigo': codigo, 'nome': next(iter(nomes), ''), 'motivos': motivos})
         else:
             aceitas.append({'codigo': codigo, 'nome': next(iter(nomes)), 'avisos': avisos,
+                            'ficha': {campo: next(iter(v)) for campo, v in ficha.items() if v},
                             'ops': sorted(ops, key=lambda o: o['sequencia'])})
 
     if sem_codigo:
@@ -209,11 +227,15 @@ def validar(linhas, maquinas):
 # Comparação e gravação
 # ---------------------------------------------------------------------------
 
-def _diferencas(nome_atual, nome_novo, atual, novo):
+def _diferencas(nome_atual, nome_novo, atual, novo, ficha_atual=None, ficha_nova=None):
     """Lista de mudanças legíveis entre o roteiro do banco e o do arquivo."""
     mudancas = []
     if nome_atual != nome_novo:
         mudancas.append(f"nome: '{nome_atual}' -> '{nome_novo}'")
+    for campo, valor in (ficha_nova or {}).items():
+        antes = (ficha_atual or {}).get(campo) or ''
+        if antes != valor:
+            mudancas.append(f"ficha {campo}: '{antes}' -> '{valor}'" if antes else f"ficha {campo} preenchido: '{valor}'")
     for seq in sorted(set(atual) | set(novo)):
         if seq not in atual:
             mudancas.append(f'sequência {seq} adicionada: {novo[seq][0]}, {novo[seq][1]} min')
@@ -233,12 +255,15 @@ def _diferencas(nome_atual, nome_novo, atual, novo):
 
 
 def _gravar_peca(c, peca, atual):
+    ficha = peca.get('ficha', {})
     if atual is None:
-        peca_id = c.execute('INSERT INTO pecas (codigo, nome) VALUES (?, ?)',
-                            (peca['codigo'], peca['nome'])).lastrowid
+        colunas = ['codigo', 'nome'] + list(ficha)
+        peca_id = c.execute(f'INSERT INTO pecas ({', '.join(colunas)}) VALUES ({', '.join('?' * len(colunas))})',
+                            [peca['codigo'], peca['nome']] + list(ficha.values())).lastrowid
     else:
         peca_id = atual['id']
-        c.execute('UPDATE pecas SET nome = ? WHERE id = ?', (peca['nome'], peca_id))
+        sets = ['nome = ?'] + [f'{campo} = ?' for campo in ficha]   # só a ficha preenchida é gravada
+        c.execute(f'UPDATE pecas SET {', '.join(sets)} WHERE id = ?', [peca['nome']] + list(ficha.values()) + [peca_id])
     for op in peca['ops']:
         c.execute('''INSERT INTO operacoes (peca_id, sequencia, maquina, tempo_estimado, descricao)
                      VALUES (?, ?, ?, ?, ?)
@@ -261,7 +286,7 @@ def aplicar(conn, aceitas, gravar):
     resultado = []
     try:
         for peca in aceitas:
-            atual = c.execute('SELECT id, nome FROM pecas WHERE codigo = ?',
+            atual = c.execute(f'SELECT id, nome, {', '.join(FICHA)} FROM pecas WHERE codigo = ?',
                               (peca['codigo'],)).fetchone()
             novo = {o['sequencia']: (o['maquina'], o['tempo'], o['descricao'] or '')
                     for o in peca['ops']}
@@ -271,7 +296,8 @@ def aplicar(conn, aceitas, gravar):
                 antigo = {r['sequencia']: (r['maquina'], r['tempo_estimado'], r['descricao'] or '')
                           for r in c.execute('SELECT sequencia, maquina, tempo_estimado, descricao '
                                              'FROM operacoes WHERE peca_id = ?', (atual['id'],))}
-                mudancas = _diferencas(atual['nome'], peca['nome'], antigo, novo)
+                mudancas = _diferencas(atual['nome'], peca['nome'], antigo, novo,
+                                       {campo: atual[campo] for campo in FICHA}, peca.get('ficha'))
                 situacao = 'atualizada' if mudancas else SEM_MUDANCAS
                 peca_id = atual['id']
             if gravar and situacao != SEM_MUDANCAS:
@@ -306,6 +332,8 @@ def imprimir(caminho, codificacao, ignoradas, resultado, recusadas, gravou):
         for o in p['ops']:
             detalhe = f" - {o['descricao']}" if o['descricao'] else ''
             print(f"      {o['sequencia']}. {o['maquina']} - {o['tempo']} min{detalhe}")
+        if p.get('ficha'):
+            print('      ficha: ' + '; '.join(f'{k}={v}' for k, v in p['ficha'].items()))
         for m in r['mudancas']:
             print(f'      alteração: {m}')
         for a in p['avisos']:
@@ -332,7 +360,7 @@ def imprimir(caminho, codificacao, ignoradas, resultado, recusadas, gravou):
 def main(argv=None):
     sys.stdout.reconfigure(errors='replace')
     ap = argparse.ArgumentParser(description='Importa peças e roteiros de um CSV (veja modelo_pecas.csv).')
-    ap.add_argument('arquivo', help='CSV com codigo;nome;sequencia;maquina;tempo_estimado_min;descricao')
+    ap.add_argument('arquivo', help='CSV com codigo;nome;sequencia;maquina;tempo_estimado_min;descricao[;ficha técnica]')
     ap.add_argument('--simular', action='store_true',
                     help='valida e mostra o que aconteceria, sem gravar nada')
     args = ap.parse_args(argv)

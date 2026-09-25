@@ -934,3 +934,27 @@ input::placeholder, textarea::placeholder { color: #8A97A6; }
 @media (max-width: 900px) {
   .prog-rotulo, .prog-rotulo-vazio { width: 120px; }
 }
+
+/* ------------------------------------------- busca de OS / catálogo de peças -- */
+
+.texto-suave { color: var(--cinza-texto); font-size: 12.5px; }
+
+.filtros-os {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px 14px;
+  align-items: end;
+}
+.filtros-os label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--cinza-texto); }
+.filtros-os input, .filtros-os select { padding: 8px 10px; font-size: 13.5px; border: 1px solid var(--cinza-borda); border-radius: var(--raio); background: var(--branco); }
+.filtros-os .filtro-largo { grid-column: 1 / -1; }
+.filtros-os .filtro-check { flex-direction: row; align-items: center; gap: 8px; padding-bottom: 8px; }
+.filtros-os .filtro-check input { width: auto; }
+.filtro-acoes { display: flex; gap: 10px; align-items: center; }
+
+.th-ordenavel { cursor: pointer; user-select: none; }
+.th-ordenavel:hover { text-decoration: underline; }
+.linha-clicavel { cursor: pointer; }
+
+.paginacao { display: flex; gap: 14px; align-items: center; justify-content: flex-end; margin-top: 14px; font-size: 13px; }
+.paginacao select { padding: 6px 8px; border: 1px solid var(--cinza-borda); border-radius: var(--raio); }

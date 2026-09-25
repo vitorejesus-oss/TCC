@@ -208,3 +208,58 @@ class TestTextoIndicadores:
         texto = bt.texto_indicadores(
             {'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': []}, None)
         assert 'Disponibilidade' in texto
+
+
+class TestDesenhoEFichaNoBot:
+    def _botoes(self, teclado):
+        return [(b.text, b.callback_data) for linha in teclado.inline_keyboard for b in linha]
+
+    def test_botao_desenho_ao_lado_da_operacao_quando_a_peca_tem_pdf(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')])
+        botoes = self._botoes(bt.teclado_fila(itens, 'operador', com_desenho=frozenset({'40-091799'})))
+        assert ('📄 Desenho', 'dw:40-091799') in botoes
+
+    def test_sem_pdf_nao_aparece_botao_de_desenho(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op(1, 1, 'LIBERADO')])
+        assert not [b for b in self._botoes(bt.teclado_fila(itens, 'operador')) if 'Desenho' in b[0]]
+        assert not [b for b in self._botoes(bt.teclado_fila(itens, 'operador', frozenset({'OUTRA'}))) if 'Desenho' in b[0]]
+
+    def test_codigo_que_nao_cabe_no_callback_nao_gera_botao(self):
+        assert bt.botao_desenho('X' * 80) is None
+        assert bt.botao_desenho('') is None
+
+    def test_ficha_curta_mostra_so_material_dimensoes_e_aplicacao_existentes(self):
+        peca = {'ficha': {'material': 'Aço 1045', 'aplicacao': 'Prensa P-12', 'tolerancia': 'H7'}}
+        texto = bt.texto_ficha_curta(peca)
+        assert texto == 'Material: Aço 1045\nAplicação: Prensa P-12'   # tolerância fica de fora, dimensões vazia some
+
+    def test_ficha_vazia_ou_peca_ausente_nao_gera_texto_nem_placeholder(self):
+        assert bt.texto_ficha_curta({'ficha': {}}) == ''
+        assert bt.texto_ficha_curta(None) == ''
+        assert 'informad' not in bt.texto_ficha_curta({'ficha': {'material': 'Aço'}})
+
+
+class TestTextoBuscaOS:
+    def test_sem_resultado(self):
+        assert 'Nenhuma OS' in bt.texto_busca_os({'itens': [], 'total': 0})
+
+    def test_linha_da_os(self):
+        texto = bt.texto_busca_os({'total': 1, 'itens': [{
+            'numero': 'OS-2026-0042', 'peca_nome': 'Placa Bronze A', 'status': 'USINANDO', 'prioridade': 'URGENTE',
+            'maquina_atual': 'Torno Horizontal', 'planejado_min': 210, 'realizado_min': None, 'em_atraso': False}]})
+        assert '🚨 OS-2026-0042' in texto and 'Placa Bronze A' in texto
+        assert 'Em usinagem' in texto and 'na Torno Horizontal' in texto and 'planejado 3h30min' in texto
+        assert 'realizado' not in texto and 'atraso' not in texto
+
+    def test_realizado_e_atraso_aparecem_quando_existem(self):
+        texto = bt.texto_busca_os({'total': 1, 'itens': [{
+            'numero': 'OS-1', 'peca_nome': 'X', 'status': 'USINANDO', 'prioridade': 'NORMAL',
+            'planejado_min': 60, 'realizado_min': 75, 'em_atraso': True, 'atraso_min': 125}]})
+        assert 'realizado 1h15min' in texto and 'em atraso há 2h05min' in texto
+        assert 'em atraso há 3d 5h' in bt.texto_busca_os({'total': 1, 'itens': [{
+            'numero': 'OS-2', 'peca_nome': 'X', 'status': 'USINANDO', 'prioridade': 'NORMAL',
+            'em_atraso': True, 'atraso_min': 3 * 1440 + 5 * 60 + 7}]})
+
+    def test_avisa_quando_ha_mais_do_que_o_mostrado(self):
+        itens = [{'numero': f'OS-{i}', 'peca_nome': 'X', 'status': 'CONCLUIDA', 'prioridade': 'NORMAL'} for i in range(5)]
+        assert 'mostrando 5 de 12' in bt.texto_busca_os({'total': 12, 'itens': itens})

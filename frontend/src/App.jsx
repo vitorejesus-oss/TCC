@@ -15,6 +15,7 @@ const MODULOS = [
     telas: [
       { id: 'notas', nome: 'Abrir nota' },
       { id: 'sap', nome: 'Importação SAP' },
+      { id: 'catalogo', nome: 'Catálogo de peças' },
     ],
   },
   {
@@ -22,6 +23,7 @@ const MODULOS = [
     nome: 'Planejamento',
     telas: [
       { id: 'programacao', nome: 'Programação' },
+      { id: 'busca', nome: 'Buscar OS' },
     ],
   },
   {
@@ -58,6 +60,283 @@ const MODULOS = [
     ],
   },
 ];
+
+const ROTULOS_FICHA = {
+  material: 'Material',
+  dimensoes: 'Dimensões',
+  tolerancia: 'Tolerância',
+  aplicacao: 'Aplicação',
+  observacoes_tecnicas: 'Observações técnicas',
+};
+
+function formatarMin(min) {
+  if (min === null || min === undefined) return '—';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return h ? `${h}h${String(m).padStart(2, '0')}` : `${m}min`;
+}
+
+// "há 2d 3h" / "há 45min" para o atraso de uma OS.
+function formatarAtraso(min) {
+  if (min === null || min === undefined) return '—';
+  const d = Math.floor(min / 1440);
+  const h = Math.floor((min % 1440) / 60);
+  if (d) return `há ${d}d ${h}h`;
+  if (h) return `há ${h}h${String(min % 60).padStart(2, '0')}`;
+  return `há ${min}min`;
+}
+
+const ROTULOS_STATUS_OS = { PLANEJAMENTO: 'Planejamento', USINANDO: 'Em usinagem', CONCLUIDA: 'Concluída' };
+const FILTROS_VAZIOS = {
+  q: '', maquina_id: '', status: '', prioridade: '', criada_de: '', criada_ate: '',
+  concluida_de: '', concluida_ate: '', operador: '', em_atraso: false,
+};
+
+// Catálogo de peças: o que já tem desenho e ficha técnica e o que falta, para a
+// equipe saber o que cadastrar. Module-level (estado próprio, sobrevive ao poll).
+function CatalogoPecas() {
+  const [pecas, setPecas] = useState(null);
+  const [soPendentes, setSoPendentes] = useState(false);
+  const [erro, setErro] = useState('');
+
+  useEffect(() => {
+    fetch(`${API_URL}/pecas`)
+      .then((r) => r.json())
+      .then(setPecas)
+      .catch(() => setErro('Não consegui carregar o catálogo'));
+  }, []);
+
+  if (erro) return <div className="painel"><p>{erro}</p></div>;
+  if (!pecas) return <div className="painel">Carregando...</div>;
+
+  const pendente = (p) => !p.tem_desenho || p.ficha_faltando.length > 0;
+  const visiveis = soPendentes ? pecas.filter(pendente) : pecas;
+  const comDesenho = pecas.filter((p) => p.tem_desenho).length;
+  const fichaCompleta = pecas.filter((p) => p.ficha_faltando.length === 0).length;
+
+  return (
+    <div className="painel">
+      <h2>Catálogo de peças</h2>
+      <p className="texto-suave" style={{ marginBottom: 14 }}>
+        {comDesenho} de {pecas.length} peça(s) com desenho técnico · {fichaCompleta} com ficha técnica completa.
+        Desenho e ficha são cadastrados por quem tem o desenho em mãos (ficha: coluna do CSV de importação); o sistema não gera medidas.
+      </p>
+      <label style={{ display: 'block', marginBottom: 12 }}>
+        <input type="checkbox" checked={soPendentes} onChange={(e) => setSoPendentes(e.target.checked)} />{' '}
+        Mostrar só peças com pendência
+      </label>
+      <div className="tabela-wrapper">
+        <table>
+          <thead>
+            <tr><th>Código</th><th>Peça</th><th>Desenho</th><th>Ficha cadastrada</th><th>Falta cadastrar</th></tr>
+          </thead>
+          <tbody>
+            {visiveis.map((p) => (
+              <tr key={p.codigo}>
+                <td className="mono">{p.codigo}</td>
+                <td>{p.nome}</td>
+                <td>
+                  {p.tem_desenho ? (
+                    <a href={`${API_URL}/pecas/${encodeURIComponent(p.codigo)}/desenho`} target="_blank" rel="noopener noreferrer">✅ Abrir PDF</a>
+                  ) : (
+                    <span className="texto-suave">— sem desenho</span>
+                  )}
+                </td>
+                <td>
+                  {Object.keys(p.ficha).length === 0 ? (
+                    <span className="texto-suave">—</span>
+                  ) : (
+                    Object.keys(ROTULOS_FICHA).filter((campo) => p.ficha[campo]).map((campo) => (
+                      <div key={campo}><strong>{ROTULOS_FICHA[campo]}:</strong> {p.ficha[campo]}</div>
+                    ))
+                  )}
+                </td>
+                <td>
+                  {p.ficha_faltando.length === 0 && p.tem_desenho ? (
+                    <span style={{ color: 'var(--verde)' }}>Completa</span>
+                  ) : (
+                    <span>
+                      {!p.tem_desenho && 'Desenho'}
+                      {!p.tem_desenho && p.ficha_faltando.length > 0 && ' · '}
+                      {p.ficha_faltando.map((c) => ROTULOS_FICHA[c]).join(', ')}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {visiveis.length === 0 && (
+              <tr><td colSpan="5" className="texto-suave">Nenhuma peça com pendência.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Busca de OS para a supervisão: filtros combináveis, tabela ordenável e
+// paginada (tudo no servidor, em GET /api/ordens-servico). Cada linha abre o
+// "Ver Mais" da nota da OS.
+function BuscaOS({ token }) {
+  const [filtros, setFiltros] = useState(FILTROS_VAZIOS);
+  const [ordenar, setOrdenar] = useState('criada_em');
+  const [direcao, setDirecao] = useState('desc');
+  const [porPagina, setPorPagina] = useState(20);
+  const [resultado, setResultado] = useState(null);
+  const [erro, setErro] = useState('');
+  const [carregando, setCarregando] = useState(false);
+  const [maquinas, setMaquinas] = useState([]);
+  const [notaAberta, setNotaAberta] = useState(null);
+
+  async function buscar({ pagina = 1, ord = ordenar, dir = direcao, pp = porPagina, f = filtros } = {}) {
+    const params = new URLSearchParams({ pagina, por_pagina: pp, ordenar: ord, direcao: dir });
+    Object.entries(f).forEach(([k, v]) => {
+      if (v === '' || v === false) return;
+      params.set(k, v === true ? '1' : v);
+    });
+    setCarregando(true);
+    setErro('');
+    try {
+      const res = await fetch(`${API_URL}/ordens-servico?${params}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.erro || 'Erro na busca');
+      setResultado(data);
+    } catch (e) {
+      setErro(e.message);
+    } finally {
+      setCarregando(false);
+    }
+  }
+
+  useEffect(() => {
+    fetch(`${API_URL}/maquinas`).then((r) => r.json()).then(setMaquinas).catch(() => {});
+    buscar();
+  }, []);
+
+  const mudar = (campo) => (e) =>
+    setFiltros({ ...filtros, [campo]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
+
+  function ordenarPor(coluna) {
+    const dir = ordenar === coluna && direcao === 'asc' ? 'desc' : 'asc';
+    setOrdenar(coluna);
+    setDirecao(dir);
+    buscar({ ord: coluna, dir });
+  }
+
+  function limpar() {
+    setFiltros(FILTROS_VAZIOS);
+    buscar({ f: FILTROS_VAZIOS });
+  }
+
+  const cabecalho = (coluna, rotulo) => (
+    <th className="th-ordenavel" onClick={() => ordenarPor(coluna)} title="Ordenar">
+      {rotulo}{ordenar === coluna ? (direcao === 'asc' ? ' ▲' : ' ▼') : ''}
+    </th>
+  );
+
+  return (
+    <div className="painel">
+      <h2>Buscar ordens de serviço</h2>
+
+      <form className="filtros-os" onSubmit={(e) => { e.preventDefault(); buscar(); }}>
+        <label className="filtro-largo">Busca livre
+          <input value={filtros.q} onChange={mudar('q')} placeholder="nº da OS ou da nota, código ou nome da peça, solicitante" />
+        </label>
+        <label>Máquina
+          <select value={filtros.maquina_id} onChange={mudar('maquina_id')}>
+            <option value="">Todas</option>
+            {maquinas.map((m) => <option key={m.id} value={m.id}>{m.nome}</option>)}
+          </select>
+        </label>
+        <label>Situação
+          <select value={filtros.status} onChange={mudar('status')}>
+            <option value="">Todas</option>
+            {Object.entries(ROTULOS_STATUS_OS).map(([v, r]) => <option key={v} value={v}>{r}</option>)}
+          </select>
+        </label>
+        <label>Prioridade
+          <select value={filtros.prioridade} onChange={mudar('prioridade')}>
+            <option value="">Todas</option>
+            <option value="NORMAL">Normal</option>
+            <option value="URGENTE">Urgente</option>
+          </select>
+        </label>
+        <label>Operador
+          <input value={filtros.operador} onChange={mudar('operador')} placeholder="e-mail ou parte" />
+        </label>
+        <label>Criada de <input type="date" value={filtros.criada_de} onChange={mudar('criada_de')} /></label>
+        <label>Criada até <input type="date" value={filtros.criada_ate} onChange={mudar('criada_ate')} /></label>
+        <label>Concluída de <input type="date" value={filtros.concluida_de} onChange={mudar('concluida_de')} /></label>
+        <label>Concluída até <input type="date" value={filtros.concluida_ate} onChange={mudar('concluida_ate')} /></label>
+        <label className="filtro-check">
+          <input type="checkbox" checked={filtros.em_atraso} onChange={mudar('em_atraso')} /> Só em atraso
+        </label>
+        <div className="filtro-acoes">
+          <button type="submit" className="btn-nota" style={{ width: 'auto', padding: '10px 22px' }}>Buscar</button>
+          <button type="button" className="btn-pequeno" onClick={limpar}>Limpar filtros</button>
+        </div>
+      </form>
+
+      {erro && <p style={{ color: 'var(--vermelho)', margin: '12px 0' }}>{erro}</p>}
+
+      {resultado && (
+        <>
+          <p className="texto-suave" style={{ margin: '14px 0 8px' }}>
+            {carregando ? 'Buscando...' : `${resultado.total} OS encontrada(s)`}
+          </p>
+          <div className="tabela-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  {cabecalho('numero', 'OS')}
+                  {cabecalho('peca', 'Peça')}
+                  {cabecalho('status', 'Situação')}
+                  {cabecalho('prioridade', 'Prioridade')}
+                  {cabecalho('maquina_atual', 'Máquina atual')}
+                  {cabecalho('planejado_min', 'Planejado × Realizado')}
+                  {cabecalho('atraso_min', 'Atraso')}
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {resultado.itens.map((o) => (
+                  <tr key={o.id} className="linha-clicavel" onClick={() => setNotaAberta(o.nota_id)}>
+                    <td><strong>{o.numero}</strong><div className="texto-suave mono">{o.nota_numero}</div></td>
+                    <td>{o.peca_nome}<div className="texto-suave mono">{o.peca_codigo}</div></td>
+                    <td><span className="status-badge">{ROTULOS_STATUS_OS[o.status] || o.status}</span></td>
+                    <td><span className={o.prioridade === 'URGENTE' ? 'badge-urgente' : 'badge-normal'}>{o.prioridade}</span></td>
+                    <td>{o.maquina_atual || <span className="texto-suave">—</span>}</td>
+                    <td className="mono">{formatarMin(o.planejado_min)} × {formatarMin(o.realizado_min)}</td>
+                    <td>{o.em_atraso
+                      ? <span style={{ color: 'var(--vermelho)', fontWeight: 600 }}>{formatarAtraso(o.atraso_min)}</span>
+                      : <span className="texto-suave">—</span>}</td>
+                    <td><button className="btn-pequeno" onClick={(e) => { e.stopPropagation(); setNotaAberta(o.nota_id); }}>Ver Mais</button></td>
+                  </tr>
+                ))}
+                {resultado.itens.length === 0 && (
+                  <tr><td colSpan="8" className="texto-suave">Nenhuma OS com esses filtros.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="paginacao">
+            <button className="btn-pequeno" disabled={resultado.pagina <= 1 || carregando}
+                    onClick={() => buscar({ pagina: resultado.pagina - 1 })}>← Anterior</button>
+            <span>Página {resultado.pagina} de {resultado.paginas}</span>
+            <button className="btn-pequeno" disabled={resultado.pagina >= resultado.paginas || carregando}
+                    onClick={() => buscar({ pagina: resultado.pagina + 1 })}>Próxima →</button>
+            <select value={porPagina} onChange={(e) => { const pp = Number(e.target.value); setPorPagina(pp); buscar({ pp }); }}>
+              {[10, 20, 50].map((n) => <option key={n} value={n}>{n} por página</option>)}
+            </select>
+          </div>
+        </>
+      )}
+
+      {notaAberta && <ModalVerMais notaId={notaAberta} token={token} onClose={() => setNotaAberta(null)} />}
+    </div>
+  );
+}
 
 // Vínculo do Telegram (tela Acesso). Fora do componente principal pelo mesmo
 // motivo do ModalVerMais: a contagem regressiva perderia o estado a cada poll.
@@ -190,6 +469,20 @@ function ModalVerMais({ notaId, token, onClose }) {
               <p><strong>Código:</strong> {detalhes.peca.codigo}</p>
               {detalhes.peca.descricao && (
                 <p><strong>Descrição:</strong> {detalhes.peca.descricao}</p>
+              )}
+              {/* Ficha técnica: campo vazio não aparece (nada de "não informado") */}
+              {Object.keys(ROTULOS_FICHA).filter((campo) => detalhes.peca.ficha?.[campo]).map((campo) => (
+                <p key={campo}><strong>{ROTULOS_FICHA[campo]}:</strong> {detalhes.peca.ficha[campo]}</p>
+              ))}
+            </section>
+
+            <section className="modal-section">
+              <h3>📐 Desenho técnico</h3>
+              {detalhes.peca.tem_desenho ? (
+                <a className="btn-pequeno" href={`${API_URL}/pecas/${encodeURIComponent(detalhes.peca.codigo)}/desenho`}
+                   target="_blank" rel="noopener noreferrer">📄 Abrir desenho (PDF)</a>
+              ) : (
+                <p className="texto-suave">Desenho não cadastrado</p>
               )}
             </section>
 
@@ -1636,6 +1929,8 @@ export default function SistemaAutomacao() {
       {tab === 'backup' && <PainelBackup />}
       {tab === 'estatisticas' && telaPermitida('estatisticas') && <PainelEstatisticas />}
       {tab === 'programacao' && <PainelProgramacao socket={socketRef.current} />}
+      {tab === 'busca' && <BuscaOS token={token} />}
+      {tab === 'catalogo' && <CatalogoPecas />}
       {tab === 'login' && <PainelLogin />}
       {/* Fora do PainelLogin (aninhado, remonta a cada poll de 10s e perderia o código e a contagem). */}
       {tab === 'login' && token && (

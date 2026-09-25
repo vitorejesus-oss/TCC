@@ -199,16 +199,71 @@ def texto_fila_operacoes(itens, pode_executar=True):
     return '\n'.join(linhas)
 
 
-def teclado_fila(itens, role):
-    """Um botão por operação (Iniciar ou Concluir), só para quem executa."""
+def botao_desenho(codigo):
+    """📄 Desenho da peça, ou None se o código não cabe no callback_data (64 bytes)."""
+    dados = f'dw:{codigo}'
+    if not codigo or len(dados.encode()) > 64:
+        return None
+    return InlineKeyboardButton('📄 Desenho', callback_data=dados)
+
+
+def teclado_fila(itens, role, com_desenho=frozenset()):
+    """Um botão por operação (Iniciar ou Concluir), só para quem executa, e o
+    📄 Desenho da peça ao lado quando ela tem PDF cadastrado (`com_desenho` =
+    códigos de peça com desenho)."""
     if role not in PAPEIS_EXECUTAM:
         return None
     linhas = []
     for it in itens[:LIMITE_FILA]:
         acao, rotulo = ('c', '✅ Concluir') if it['status'] == 'EXECUTANDO' else ('i', '▶️ Iniciar')
-        linhas.append([InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
-                                            callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}")])
+        linha = [InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
+                                      callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}")]
+        if it.get('peca_codigo') in com_desenho and botao_desenho(it['peca_codigo']):
+            linha.append(botao_desenho(it['peca_codigo']))
+        linhas.append(linha)
     return InlineKeyboardMarkup(linhas) if linhas else None
+
+
+def texto_ficha_curta(peca):
+    """Material, dimensões e aplicação da peça, só o que existir. '' se nada."""
+    ficha = (peca or {}).get('ficha') or {}
+    linhas = [f"{rotulo}: {ficha[campo]}" for campo, rotulo in
+              (("material", "Material"), ("dimensoes", "Dimensões"), ("aplicacao", "Aplicação"))
+              if ficha.get(campo)]
+    return '\n'.join(linhas)
+
+
+def texto_atraso(minutos):
+    """'há 3d 5h', 'há 2h05min' ou 'há 40min' (dias só a partir de 24h)."""
+    if minutos is None:
+        return 'há ?'
+    d, resto = divmod(max(int(minutos), 0), 1440)
+    if d:
+        return f'há {d}d {resto // 60}h'
+    return 'há ' + texto_duracao(resto)
+
+
+def texto_busca_os(dados):
+    """Resposta paginada de GET /ordens-servico?q=... -> texto para o chat."""
+    itens = dados.get('itens', [])
+    if not itens:
+        return '🔎 Nenhuma OS encontrada.'
+    situacao = {'PLANEJAMENTO': 'Planejamento', 'USINANDO': 'Em usinagem', 'CONCLUIDA': 'Concluída'}
+    linhas = [f"🔎 {dados.get('total', len(itens))} OS encontrada(s):"]
+    for o in itens:
+        marca = '🚨 ' if o.get('prioridade') == 'URGENTE' else ''
+        linhas.append(f"\n{marca}{o['numero']} — {o.get('peca_nome') or o.get('peca_codigo', '?')}")
+        partes = [situacao.get(o['status'], o['status'])]
+        if o.get('maquina_atual'):
+            partes.append(f"na {o['maquina_atual']}")
+        partes.append(f"planejado {texto_duracao(o.get('planejado_min'))}"
+                      + (f" × realizado {texto_duracao(o['realizado_min'])}" if o.get('realizado_min') is not None else ''))
+        linhas.append('   ' + ' · '.join(partes))
+        if o.get('em_atraso'):
+            linhas.append(f"   ⏰ em atraso {texto_atraso(o.get('atraso_min'))}")
+    if dados.get('total', 0) > len(itens):
+        linhas.append(f"\n... mostrando {len(itens)} de {dados['total']}. Refine a busca.")
+    return '\n'.join(linhas)
 
 
 def traduzir_erro_acao(erro):
@@ -282,7 +337,7 @@ TEXTO_AJUDA = (
     '  (gere o código no site: Acesso > Gerar código de vínculo)\n'
     '/menu — opções disponíveis para o seu papel\n'
     '/maquinas — situação das 8 máquinas\n'
-    '/os — ordens de serviço pendentes\n'
+    '/os — ordens de serviço pendentes; /os <número> busca uma OS\n'
     '/fila — fila de produção: iniciar e concluir operações (operador e coordenador)\n'
     '/desenho <código> — desenho técnico da peça (PDF)\n'
     '/indicadores — disponibilidade e MTTR (coordenador, gestor, diretor)\n'
@@ -382,6 +437,12 @@ async def maquinas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ordens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
+    if context.args:   # /os <número da OS, da nota, peça ou solicitante>: mesma busca do site
+        dados, erro = chamar_api(telegram_id, 'GET', '/ordens-servico',
+                                 params={'q': ' '.join(context.args), 'pagina': 1, 'por_pagina': 5,
+                                         'ordenar': 'criada_em', 'direcao': 'desc'})
+        await update.message.reply_text(erro or texto_busca_os(dados))
+        return
     dados, erro = chamar_api(telegram_id, 'GET', '/ordens-servico')
     await update.message.reply_text(erro or texto_ordens(dados))
 
@@ -410,7 +471,10 @@ def _fila_pronta(telegram_id):
     itens, erro = montar_fila(telegram_id)
     if erro:
         return erro, None
-    return texto_fila_operacoes(itens, pode_executar=role in PAPEIS_EXECUTAM), teclado_fila(itens, role)
+    pecas, _erro_pecas = chamar_api(telegram_id, 'GET', '/pecas')   # sem ela, só some o botão 📄
+    com_desenho = frozenset(p['codigo'] for p in (pecas or []) if p.get('tem_desenho'))
+    return (texto_fila_operacoes(itens, pode_executar=role in PAPEIS_EXECUTAM),
+            teclado_fila(itens, role, com_desenho))
 
 
 async def fila(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,11 +492,15 @@ OBS_VALIDADE_MIN = 10
 OBS_MAX_CHARS = 500
 
 
-def _teclado_confirmar(acao_confirmar, aid, os_id):
-    return InlineKeyboardMarkup([[
+def _teclado_confirmar(acao_confirmar, aid, os_id, extra=None):
+    """[Confirmar][Cancelar], mais uma linha opcional de botões (ex.: 📄 Desenho)."""
+    linhas = [[
         InlineKeyboardButton('✅ Confirmar', callback_data=f'op:{acao_confirmar}:{aid}:{os_id}'),
         InlineKeyboardButton('❌ Cancelar', callback_data='op:x:0:0'),
-    ]])
+    ]]
+    if extra:
+        linhas.append(extra)
+    return InlineKeyboardMarkup(linhas)
 
 
 def _buscar_operacao(telegram_id, os_id, aid):
@@ -444,6 +512,17 @@ def _buscar_operacao(telegram_id, os_id, aid):
     if not op:
         return None, ops, 'Operação não encontrada'
     return op, ops, None
+
+
+def _peca_da_os(telegram_id, os_id):
+    """A peça (com ficha e tem_desenho, de GET /pecas) da OS, ou None."""
+    os_, erro = chamar_api(telegram_id, 'GET', f'/ordens-servico/{os_id}')
+    if erro:
+        return None
+    pecas, erro = chamar_api(telegram_id, 'GET', '/pecas')
+    if erro:
+        return None
+    return next((p for p in pecas if p['codigo'] == os_.get('peca_codigo')), None)
 
 
 async def _executar_iniciar(query, telegram_id, aid, os_id):
@@ -502,10 +581,18 @@ async def acao_operacao(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
                 'Operação já concluída' if op['status'] == 'CONCLUIDO' else 'Operação ainda não foi iniciada'))
             return
         verbo = 'Iniciar' if acao == 'i' else 'Concluir'
-        await query.edit_message_text(
-            f"{verbo} a OP {op['sequencia']} na {op['maquina_nome']}?\n"
-            f"Estimado: {texto_duracao(op.get('tempo_planejado_min'))}",
-            reply_markup=_teclado_confirmar('ic' if acao == 'i' else 'cc', aid, os_id))
+        texto = (f"{verbo} a OP {op['sequencia']} na {op['maquina_nome']}?\n"
+                 f"Estimado: {texto_duracao(op.get('tempo_planejado_min'))}")
+        extra = None
+        if acao == 'i':
+            peca = _peca_da_os(telegram_id, os_id)
+            ficha = texto_ficha_curta(peca)
+            if ficha:
+                texto += f"\n\n📐 {peca['nome']}\n{ficha}"
+            if peca and peca.get('tem_desenho') and botao_desenho(peca['codigo']):
+                extra = [botao_desenho(peca['codigo'])]
+        teclado = _teclado_confirmar('ic' if acao == 'i' else 'cc', aid, os_id, extra)
+        await query.edit_message_text(texto, reply_markup=teclado)
         return
 
     if acao == 'ic':
@@ -569,26 +656,29 @@ async def desenho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text('Uso: /desenho 40-091799')
         return
-    codigo = context.args[0].strip()
-    telegram_id = update.effective_user.id
+    await enviar_desenho(update.message, update.effective_user.id, context.args[0].strip())
+
+
+async def enviar_desenho(mensagem, telegram_id, codigo):
+    """Busca o PDF da peça pela API e o envia no chat de `mensagem`."""
     token, _role, _email = obter_sessao(telegram_id)
     if not token:
-        await update.message.reply_text('Você ainda não vinculou sua conta. Use /vincular <código>.')
+        await mensagem.reply_text('Você ainda não vinculou sua conta. Use /vincular <código>.')
         return
 
     try:
         resp = requests.get(f'{API_URL}/pecas/{codigo}/desenho',
                            headers={'Authorization': f'Bearer {token}'}, timeout=TIMEOUT)
     except requests.exceptions.RequestException as e:
-        await update.message.reply_text(f'Não consegui falar com o backend: {e}')
+        await mensagem.reply_text(f'Não consegui falar com o backend: {e}')
         return
 
     if resp.status_code == 200:
-        await update.message.reply_document(document=resp.content, filename=f'{codigo}.pdf')
+        await mensagem.reply_document(document=resp.content, filename=f'{codigo}.pdf')
     elif resp.status_code == 404:
-        await update.message.reply_text(f'Não achei desenho técnico para a peça {codigo}.')
+        await mensagem.reply_text(f'Não achei desenho técnico para a peça {codigo}.')
     else:
-        await update.message.reply_text(f'Erro {resp.status_code} ao buscar o desenho.')
+        await mensagem.reply_text(f'Erro {resp.status_code} ao buscar o desenho.')
 
 
 ACOES_MENU = {
@@ -613,6 +703,10 @@ async def botao_pressionado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if acao.startswith('op:'):
         await acao_operacao(update, context, query, acao)
+        return
+
+    if acao.startswith('dw:'):   # 📄 Desenho: manda o PDF sem o operador digitar o código
+        await enviar_desenho(query.message, telegram_id, acao[3:])
         return
 
     if acao == 'fila':

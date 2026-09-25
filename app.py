@@ -90,6 +90,27 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://frontend-xi-two-5l7d05gqtg.vercel.app')
 DESENHOS_DIR = 'desenhos_tecnicos'
 
+# Ficha técnica da peça (colunas opcionais de `pecas`) e o rótulo de cada uma.
+FICHA_CAMPOS = ('material', 'dimensoes', 'tolerancia', 'aplicacao', 'observacoes_tecnicas')
+FICHA_ROTULOS = {'material': 'Material', 'dimensoes': 'Dimensões', 'tolerancia': 'Tolerância',
+                 'aplicacao': 'Aplicação', 'observacoes_tecnicas': 'Observações técnicas'}
+CODIGO_PECA_REGEX = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def tem_desenho(codigo):
+    """True se existe desenhos_tecnicos/<codigo>.pdf (e o código é seguro)."""
+    return bool(codigo) and bool(CODIGO_PECA_REGEX.match(codigo)) and \
+        os.path.isfile(os.path.join(DESENHOS_DIR, f'{codigo}.pdf'))
+
+
+def ficha_da_peca(linha):
+    """Ficha técnica de uma linha de `pecas`: só os campos preenchidos, mais
+    quais faltam. Campo vazio não vira texto nenhum."""
+    preenchidos = {c: linha[c].strip() for c in FICHA_CAMPOS
+                   if c in linha.keys() and linha[c] and str(linha[c]).strip()}
+    return {'ficha': preenchidos,
+            'ficha_faltando': [c for c in FICHA_CAMPOS if c not in preenchidos]}
+
 # Bot do Telegram (Etapa 1) - token de serviço bot->API, nunca o token do
 # BotFather (esse é do bot_telegram.py). Sem isto configurado, /vincular e
 # /token recusam qualquer chamada (ver _bot_autorizado).
@@ -309,6 +330,14 @@ def init_db():
     ]:
         if coluna not in colunas_relatorio:
             c.execute(f'ALTER TABLE relatorios_manutencao ADD COLUMN {coluna} {tipo_sql}')
+
+    # --- Ficha técnica da peça: todos opcionais, preenchidos por quem tem o
+    # desenho em mãos (CSV do importar_pecas.py). O sistema não gera medidas.
+    c.execute("PRAGMA table_info(pecas)")
+    colunas_pecas = {row[1] for row in c.fetchall()}
+    for coluna in FICHA_CAMPOS:
+        if coluna not in colunas_pecas:
+            c.execute(f'ALTER TABLE pecas ADD COLUMN {coluna} TEXT')
 
     # --- Origem do dado: 'REAL' (medido no chão de fábrica) ou 'DEMONSTRACAO'
     # (gerado por seed_demo.py). Fica em notas e em relatorios_manutencao, as
@@ -1502,7 +1531,9 @@ def get_nota_detalhes(nota_id):
         'peca': {
             'codigo': nota['peca_codigo'],
             'nome': peca['nome'] if peca else 'Desconhecida',
-            'descricao': peca['descricao'] if peca else None
+            'descricao': peca['descricao'] if peca else None,
+            **(ficha_da_peca(peca) if peca else {'ficha': {}, 'ficha_faltando': list(FICHA_CAMPOS)}),
+            'tem_desenho': tem_desenho(nota['peca_codigo']),
         },
         'quantidade': nota['quantidade'],
         'prioridade': nota['prioridade'],
@@ -1573,22 +1604,190 @@ def criar_nota():
     finally:
         conn.close()
 
+# Busca de OS: colunas de ordenação aceitas (nome do parâmetro -> expressão SQL).
+ORDENACOES_OS = {
+    'numero': 'os.numero', 'nota': 'n.numero', 'peca': 'p.nome COLLATE NOCASE',
+    'status': 'os.status', 'prioridade': 'os.prioridade', 'criada_em': 'os.criada_em',
+    'concluida_em': 'os.concluida_em', 'maquina_atual': 'maquina_atual COLLATE NOCASE',
+    'planejado_min': 'planejado_min', 'realizado_min': 'realizado_min', 'atraso_min': 'atraso_min',
+}
+STATUS_OS = ('PLANEJAMENTO', 'USINANDO', 'CONCLUIDA')
+POR_PAGINA_PADRAO, POR_PAGINA_MAX = 20, 100
+
+
+def _data_param(nome, fim_do_dia=False):
+    """?nome=YYYY-MM-DD -> (limite_iso, None); com fim_do_dia, o limite é o
+    início do dia SEGUINTE (uso: coluna < limite). (None, None) se ausente."""
+    valor = (request.args.get(nome) or '').strip()
+    if not valor:
+        return None, None
+    try:
+        dia = datetime.strptime(valor, '%Y-%m-%d')
+    except ValueError:
+        return None, f'{nome} inválida. Use YYYY-MM-DD'
+    if fim_do_dia:
+        dia += timedelta(days=1)
+    return dia.strftime('%Y-%m-%dT%H:%M:%S'), None
+
+
+def _int_param(nome, padrao, minimo, maximo):
+    bruto = (request.args.get(nome) or '').strip()
+    if not bruto:
+        return padrao, None
+    if not re.fullmatch(r'[0-9]+', bruto) or not (minimo <= int(bruto) <= maximo):
+        return None, f'{nome} inválido. Use um inteiro de {minimo} a {maximo}'
+    return int(bruto), None
+
+
 @app.route('/api/ordens-servico', methods=['GET'])
 def get_ordens():
-    """Lista todas as OS"""
+    """Lista/busca OS.
+
+    Sem parâmetros: todas as OS, do jeito de sempre (urgentes primeiro, mais
+    antigas antes), como uma lista JSON.
+
+    Filtros (combináveis, todos opcionais):
+      q             texto livre: nº da OS, nº da nota, código ou nome da peça, solicitante
+      maquina_id    OS com alguma operação nessa máquina
+      status        PLANEJAMENTO | USINANDO | CONCLUIDA
+      prioridade    NORMAL | URGENTE
+      criada_de / criada_ate / concluida_de / concluida_ate   YYYY-MM-DD (inclusivos)
+      operador      parte do e-mail de quem executou alguma operação
+      em_atraso     1 = OS aberta com operação não concluída cujo fim planejado já passou
+      origem        REAL | DEMONSTRACAO | TODAS (padrão)
+    Ordenação: ordenar=<coluna> & direcao=asc|desc (ver ORDENACOES_OS).
+    Paginação: pagina e/ou por_pagina (padrão 20, máx. 100) trocam a resposta
+    para {itens, total, pagina, por_pagina, paginas}.
+
+    Cada OS traz maquina_atual, planejado_min, realizado_min (só das
+    operações concluídas), operadores, em_atraso e atraso_min.
+    """
+    args = request.args
+    onde, params = [], []
+
+    q = (args.get('q') or '').strip()
+    if q:
+        padrao = '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        onde.append('''(os.numero LIKE ? ESCAPE '\\' OR n.numero LIKE ? ESCAPE '\\'
+                        OR n.peca_codigo LIKE ? ESCAPE '\\' OR p.nome LIKE ? ESCAPE '\\'
+                        OR n.solicitante LIKE ? ESCAPE '\\')''')
+        params += [padrao] * 5
+
+    maquina_id = (args.get('maquina_id') or '').strip()
+    if maquina_id:
+        if not re.fullmatch(r'[0-9]+', maquina_id):
+            return jsonify({'erro': 'maquina_id inválido'}), 400
+        onde.append('EXISTS (SELECT 1 FROM alocacao_maquinas a WHERE a.ordem_servico_id = os.id AND a.maquina_id = ?)')
+        params.append(int(maquina_id))
+
+    status = (args.get('status') or '').strip().upper()
+    if status:
+        if status not in STATUS_OS:
+            return jsonify({'erro': f"status inválido. Use {', '.join(STATUS_OS)}"}), 400
+        onde.append('os.status = ?')
+        params.append(status)
+
+    prioridade = (args.get('prioridade') or '').strip().upper()
+    if prioridade:
+        if prioridade not in ('NORMAL', 'URGENTE'):
+            return jsonify({'erro': 'prioridade inválida. Use NORMAL ou URGENTE'}), 400
+        onde.append('os.prioridade = ?')
+        params.append(prioridade)
+
+    for nome, coluna, operador, fim in [('criada_de', 'os.criada_em', '>=', False),
+                                        ('criada_ate', 'os.criada_em', '<', True),
+                                        ('concluida_de', 'os.concluida_em', '>=', False),
+                                        ('concluida_ate', 'os.concluida_em', '<', True)]:
+        limite, erro = _data_param(nome, fim_do_dia=fim)
+        if erro:
+            return jsonify({'erro': erro}), 400
+        if limite:
+            # replace(' ', 'T'): linhas antigas gravaram 'YYYY-MM-DD HH:MM:SS'
+            onde.append(f"replace({coluna}, ' ', 'T') {operador} ?")
+            params.append(limite)
+
+    operador_txt = (args.get('operador') or '').strip()
+    if operador_txt:
+        padrao = '%' + operador_txt.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        onde.append('''EXISTS (SELECT 1 FROM alocacao_maquinas a WHERE a.ordem_servico_id = os.id
+                                AND a.operador LIKE ? ESCAPE '\\')''')
+        params.append(padrao)
+
+    origem, resposta_erro = _origem_da_requisicao()
+    if resposta_erro:
+        return resposta_erro
+    sql_origem, params_origem = _sql_origem(origem, 'n.origem')
+    if sql_origem:
+        onde.append(sql_origem.lstrip().removeprefix('AND ').strip())
+        params += params_origem
+
+    agora = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Operação em atraso: não concluída, em OS aberta, com o fim planejado já passado.
+    sql_atrasada = '''a.ordem_servico_id = os.id AND a.status != 'CONCLUIDO'
+                      AND a.fim_planejado IS NOT NULL AND julianday(a.fim_planejado) < julianday(?)'''
+    if (args.get('em_atraso') or '').strip().lower() in ('1', 'true', 'sim'):
+        onde.append(f"os.status != 'CONCLUIDA' AND EXISTS (SELECT 1 FROM alocacao_maquinas a WHERE {sql_atrasada})")
+        params.append(agora)
+
+    ordenar = (args.get('ordenar') or '').strip()
+    if ordenar and ordenar not in ORDENACOES_OS:
+        return jsonify({'erro': f"ordenar inválido. Use {', '.join(ORDENACOES_OS)}"}), 400
+    direcao = (args.get('direcao') or 'asc').strip().lower()
+    if direcao not in ('asc', 'desc'):
+        return jsonify({'erro': 'direcao inválida. Use asc ou desc'}), 400
+    if ordenar:
+        # NULLs por último nos dois sentidos, e desempate estável por id
+        ordem_sql = f'{ORDENACOES_OS[ordenar]} IS NULL, {ORDENACOES_OS[ordenar]} {direcao.upper()}, os.id ASC'
+    else:
+        ordem_sql = "CASE WHEN os.prioridade = 'URGENTE' THEN 0 ELSE 1 END, os.criada_em ASC"
+
+    paginado = 'pagina' in args or 'por_pagina' in args
+    pagina, erro = _int_param('pagina', 1, 1, 10**6)
+    if erro:
+        return jsonify({'erro': erro}), 400
+    por_pagina, erro = _int_param('por_pagina', POR_PAGINA_PADRAO, 1, POR_PAGINA_MAX)
+    if erro:
+        return jsonify({'erro': erro}), 400
+
+    filtro = ('WHERE ' + ' AND '.join(onde)) if onde else ''
+    base = f'''FROM ordens_servico os
+               JOIN notas n ON os.nota_id = n.id
+               JOIN pecas p ON n.peca_codigo = p.codigo
+               {filtro}'''
+
     conn = get_db()
     c = conn.cursor()
-    c.execute('''SELECT os.*, n.peca_codigo, p.nome as peca_nome
-                FROM ordens_servico os
-                JOIN notas n ON os.nota_id = n.id
-                JOIN pecas p ON n.peca_codigo = p.codigo
-                ORDER BY
-                    CASE WHEN os.prioridade = 'URGENTE' THEN 0 ELSE 1 END,
-                    os.criada_em ASC''')
+    total = c.execute(f'SELECT COUNT(*) {base}', params).fetchone()[0]
 
-    ordens = [dict(row) for row in c.fetchall()]
+    c.execute(f'''SELECT os.*, n.numero AS nota_numero, n.peca_codigo, p.nome AS peca_nome,
+                         n.solicitante, n.origem,
+                         (SELECT m.nome FROM alocacao_maquinas a JOIN maquinas m ON m.id = a.maquina_id
+                           WHERE a.ordem_servico_id = os.id AND a.status IN ('EXECUTANDO', 'LIBERADO')
+                           ORDER BY CASE a.status WHEN 'EXECUTANDO' THEN 0 ELSE 1 END, a.sequencia
+                           LIMIT 1) AS maquina_atual,
+                         (SELECT SUM(a.tempo_planejado_min) FROM alocacao_maquinas a
+                           WHERE a.ordem_servico_id = os.id) AS planejado_min,
+                         (SELECT SUM(a.tempo_realizado_min) FROM alocacao_maquinas a
+                           WHERE a.ordem_servico_id = os.id AND a.status = 'CONCLUIDO') AS realizado_min,
+                         (SELECT GROUP_CONCAT(DISTINCT a.operador) FROM alocacao_maquinas a
+                           WHERE a.ordem_servico_id = os.id AND a.operador IS NOT NULL) AS operadores,
+                         CASE WHEN os.status = 'CONCLUIDA' THEN NULL ELSE
+                           (SELECT CAST(MAX((julianday(?) - julianday(a.fim_planejado)) * 1440) AS INTEGER)
+                              FROM alocacao_maquinas a WHERE {sql_atrasada}) END AS atraso_min
+                  {base}
+                  ORDER BY {ordem_sql}''' + (' LIMIT ? OFFSET ?' if paginado else ''),
+              [agora, agora] + params + ([por_pagina, (pagina - 1) * por_pagina] if paginado else []))
+    ordens = []
+    for row in c.fetchall():
+        o = dict(row)
+        o['em_atraso'] = o['atraso_min'] is not None
+        ordens.append(o)
     conn.close()
-    return jsonify(ordens)
+
+    if not paginado:
+        return jsonify(ordens)
+    return jsonify({'itens': ordens, 'total': total, 'pagina': pagina, 'por_pagina': por_pagina,
+                    'paginas': max(1, -(-total // por_pagina))})
 
 @app.route('/api/ordens-servico/<int:os_id>', methods=['GET'])
 def get_ordem(os_id):
@@ -2122,16 +2321,19 @@ def concluir_alocacao(alocacao_id):
 
 @app.route('/api/pecas', methods=['GET'])
 def get_pecas():
-    """Lista todas as peças"""
+    """Lista todas as peças, com a ficha técnica e o que falta cadastrar
+    (tem_desenho, ficha e ficha_faltando) para a equipe ver o que está pendente."""
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT * FROM pecas')
-    pecas = [dict(row) for row in c.fetchall()]
+    c.execute('SELECT * FROM pecas ORDER BY codigo')
+    pecas = []
+    for row in c.fetchall():
+        p = {k: v for k, v in dict(row).items() if k not in FICHA_CAMPOS}   # a ficha vai em 'ficha'
+        p.update(ficha_da_peca(row))
+        p['tem_desenho'] = tem_desenho(p['codigo'])
+        pecas.append(p)
     conn.close()
     return jsonify(pecas)
-
-CODIGO_PECA_REGEX = re.compile(r'^[A-Za-z0-9_-]+$')
-
 
 @app.route('/api/pecas/<codigo>/desenho', methods=['GET'])
 def get_desenho_tecnico(codigo):

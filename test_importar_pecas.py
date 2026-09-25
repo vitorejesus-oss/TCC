@@ -11,6 +11,7 @@ import importar_pecas as imp
 
 MODELO = Path(__file__).parent / 'modelo_pecas.csv'
 CAB = 'codigo;nome;sequencia;maquina;tempo_estimado_min;descricao'
+CAB_FICHA = CAB + ';material;dimensoes;tolerancia;aplicacao;observacoes_tecnicas'
 
 
 @pytest.fixture
@@ -63,7 +64,7 @@ class TestModelo:
     def test_modelo_tem_o_cabecalho_e_duas_linhas_de_pecas_existentes(self):
         texto = MODELO.read_text(encoding='utf-8-sig')
         linhas = texto.splitlines()
-        assert linhas[0] == CAB
+        assert linhas[0] == CAB_FICHA
         assert len(linhas) == 3
 
     def test_modelo_e_valido_e_bate_com_o_catalogo_atual(self, banco):
@@ -307,3 +308,66 @@ class TestSemeaduraNaoDesfazImportacao:
             conn.close()
         app_module.seed_data()
         assert roteiro('40-122633')[0][1] == 'Fresadora Universal'
+
+
+class TestFichaTecnica:
+    """Colunas opcionais da ficha técnica da peça (o sistema não gera medidas)."""
+
+    def _ficha(self, codigo):
+        conn = app_module.get_db()
+        try:
+            r = conn.execute('SELECT material, dimensoes, tolerancia, aplicacao, observacoes_tecnicas '
+                             'FROM pecas WHERE codigo = ?', (codigo,)).fetchone()
+            return dict(r)
+        finally:
+            conn.close()
+
+    def _importar(self, caminho):
+        linhas, _, _ = imp.ler_csv(caminho)
+        aceitas, recusadas = imp.validar(linhas, maquinas_do_banco())
+        conn = app_module.get_db()
+        try:
+            return imp.aplicar(conn, aceitas, gravar=True), recusadas
+        finally:
+            conn.close()
+
+    def test_csv_sem_colunas_de_ficha_continua_valido(self, banco):
+        caminho = csv_em(banco, 'F-1;Peça F;1;Torno Horizontal;60;')
+        resultado, recusadas = self._importar(caminho)
+        assert recusadas == [] and resultado[0]['situacao'] == 'nova'
+        assert set(self._ficha('F-1').values()) == {None}
+
+    def test_grava_a_ficha_de_uma_linha_da_peca(self, banco):
+        caminho = csv_em(banco, 'F-2;Peça F;1;Torno Horizontal;60;;Aço 1045;;;Prensa hidráulica;',
+                         'F-2;Peça F;2;Torno Vertical;30;;;;;;', cab=CAB_FICHA)
+        resultado, recusadas = self._importar(caminho)
+        assert recusadas == []
+        ficha = self._ficha('F-2')
+        assert ficha['material'] == 'Aço 1045' and ficha['aplicacao'] == 'Prensa hidráulica'
+        assert ficha['dimensoes'] is None and ficha['tolerancia'] is None
+
+    def test_valores_diferentes_do_mesmo_campo_recusam_a_peca(self, banco):
+        caminho = csv_em(banco, 'F-3;Peça F;1;Torno Horizontal;60;;Aço 1045;;;;',
+                         'F-3;Peça F;2;Torno Vertical;30;;Bronze;;;;', cab=CAB_FICHA)
+        resultado, recusadas = self._importar(caminho)
+        assert resultado == [] and 'material diferente entre as linhas' in recusadas[0]['motivos'][0]
+
+    def test_campo_vazio_no_arquivo_nao_apaga_o_que_ja_existe(self, banco):
+        self._importar(csv_em(banco, 'F-4;Peça F;1;Torno Horizontal;60;;Aço 1045;10x20;;;', cab=CAB_FICHA))
+        self._importar(csv_em(banco, 'F-4;Peça F;1;Torno Horizontal;60;;;;;;', cab=CAB_FICHA, nome='b.csv'))
+        ficha = self._ficha('F-4')
+        assert ficha['material'] == 'Aço 1045' and ficha['dimensoes'] == '10x20'
+
+    def test_so_a_ficha_mudou_a_peca_conta_como_atualizada(self, banco):
+        self._importar(csv_em(banco, 'F-5;Peça F;1;Torno Horizontal;60;;Aço 1045;;;;', cab=CAB_FICHA))
+        resultado, _ = self._importar(csv_em(banco, 'F-5;Peça F;1;Torno Horizontal;60;;Aço 4140;;;;',
+                                             cab=CAB_FICHA, nome='b.csv'))
+        assert resultado[0]['situacao'] == 'atualizada'
+        assert any('ficha material' in m for m in resultado[0]['mudancas'])
+        assert self._ficha('F-5')['material'] == 'Aço 4140'
+
+    def test_ficha_igual_nao_e_mudanca(self, banco):
+        c = csv_em(banco, 'F-6;Peça F;1;Torno Horizontal;60;;Aço 1045;;;;', cab=CAB_FICHA)
+        self._importar(c)
+        resultado, _ = self._importar(c)
+        assert resultado[0]['situacao'] == imp.SEM_MUDANCAS
