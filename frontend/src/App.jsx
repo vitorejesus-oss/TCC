@@ -86,6 +86,14 @@ function formatarAtraso(min) {
   return `há ${min}min`;
 }
 
+function formatarDataHora(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime())
+    ? ts
+    : d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
 const ROTULOS_STATUS_OS = { PLANEJAMENTO: 'Planejamento', USINANDO: 'Em usinagem', CONCLUIDA: 'Concluída' };
 const FILTROS_VAZIOS = {
   q: '', maquina_id: '', status: '', prioridade: '', criada_de: '', criada_ate: '',
@@ -512,7 +520,24 @@ function ModalVerMais({ notaId, token, onClose }) {
               {detalhes.alocacoes.length > 0 && (
                 <ul>
                   {detalhes.alocacoes.map((a, i) => (
-                    <li key={i}>{a.sequencia}. {a.maquina_nome} — {a.status}</li>
+                    <li key={i}>
+                      {a.sequencia}. {a.maquina_nome} — {a.status}
+                      {a.inicio_real && (
+                        <div className="texto-suave">
+                          ⏱️ Usinagem: <strong>{formatarMin(a.tempo_usinagem_min)}</strong>
+                          {a.paradas && a.paradas.length > 0 && (
+                            <> · Parado: <strong>{formatarMin(a.tempo_parado_min)}</strong>
+                              {' '}({formatarMin(a.tempo_parado_expediente_min)} de expediente)</>
+                          )}
+                        </div>
+                      )}
+                      {(a.paradas || []).map((p, j) => (
+                        <div key={j} className="texto-suave aviso-parada">
+                          🔴 Parada {j + 1}: {formatarDataHora(p.inicio)} → {p.aberta ? 'em andamento' : formatarDataHora(p.fim)}
+                          {' '}({formatarMin(p.duracao_min)} · {formatarMin(p.expediente_min)} de expediente)
+                        </div>
+                      ))}
+                    </li>
                   ))}
                 </ul>
               )}
@@ -913,12 +938,10 @@ function PainelProgramacao({ socket }) {
         })
         .catch(() => {});
     };
-    socket.on('operacao_iniciada', recarregar);
-    socket.on('operacao_concluida', recarregar);
-    return () => {
-      socket.off('operacao_iniciada', recarregar);
-      socket.off('operacao_concluida', recarregar);
-    };
+    const eventos = ['operacao_iniciada', 'operacao_concluida', 'operacao_interrompida',
+      'operacao_liberada', 'maquina_quebrada', 'maquina_consertada'];
+    eventos.forEach((ev) => socket.on(ev, recarregar));
+    return () => eventos.forEach((ev) => socket.off(ev, recarregar));
   }, [socket, data]);
 
   function mudarDia(dias) {
@@ -991,7 +1014,9 @@ function PainelProgramacao({ socket }) {
             <span><i style={{ background: corStatus.LIBERADO }} /> Liberado</span>
             <span><i style={{ background: corStatus.EXECUTANDO }} /> Executando</span>
             <span><i style={{ background: corStatus.CONCLUIDO }} /> Concluído</span>
+            <span><i className="prog-interrompida-leg" /> Interrompida (máquina parada)</span>
             <span><i className="prog-hachura" /> Realizado</span>
+            <span><i className="prog-parada-leg" /> Trecho parado</span>
           </div>
 
           <div className="prog-wrapper">
@@ -1035,11 +1060,13 @@ function PainelProgramacao({ socket }) {
                       {b.planejado && (
                         <button
                           type="button"
-                          className={`prog-barra ${foco === b.alocacao_id ? 'foco' : ''}`}
+                          className={`prog-barra ${foco === b.alocacao_id ? 'foco' : ''} ${b.status === 'INTERROMPIDA' ? 'interrompida' : ''}`}
                           style={{
                             left: `${b.planejado.esquerda_pct}%`,
                             width: `${b.planejado.largura_pct}%`,
-                            background: corStatus[b.status] || 'var(--cinza-borda)',
+                            ...(b.status === 'INTERROMPIDA'
+                              ? {}
+                              : { background: corStatus[b.status] || 'var(--cinza-borda)' }),
                           }}
                           onClick={() =>
                             setFoco(foco === b.alocacao_id ? null : b.alocacao_id)
@@ -1060,6 +1087,16 @@ function PainelProgramacao({ socket }) {
                           title={`realizado ${b.realizado.inicio}–${b.realizado.fim}`}
                         />
                       )}
+
+                      {/* trechos em que a máquina esteve parada, sobre a faixa do realizado */}
+                      {(b.paradas || []).map((p, i) => (
+                        <div
+                          key={`p${i}`}
+                          className="prog-barra-parada"
+                          style={{ left: `${p.esquerda_pct}%`, width: `${p.largura_pct}%` }}
+                          title={`máquina parada ${p.inicio}–${p.aberta ? 'em andamento' : p.fim}`}
+                        />
+                      ))}
                     </React.Fragment>
                   ))}
                 </div>
@@ -1090,6 +1127,16 @@ function PainelProgramacao({ socket }) {
                     : '— ainda não medido'}
                 </p>
                 <p><strong>Operador:</strong> {b.operador || '—'}</p>
+                {b.status === 'INTERROMPIDA' && (
+                  <p style={{ color: 'var(--vermelho)' }}>
+                    <strong>Interrompida:</strong> a máquina quebrou; {b.tempo_acumulado_min ?? 0} min de usinagem
+                    já feitos. Volta a LIBERADO quando o conserto for registrado.
+                  </p>
+                )}
+                {(b.paradas || []).length > 0 && (
+                  <p><strong>Paradas:</strong>{' '}
+                    {b.paradas.map((p) => `${p.inicio}–${p.aberta ? 'em andamento' : p.fim}`).join(' · ')}</p>
+                )}
               </div>
             );
           })()}

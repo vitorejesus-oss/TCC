@@ -159,10 +159,11 @@ def operacoes_da_fila(ordem, operacoes):
     `ordem` é uma linha de GET /ordens-servico; `operacoes` vem de
     GET /ordens-servico/<id>/operacoes. Entram as EXECUTANDO e as prontas
     para iniciar (LIBERADO: o backend marca assim a 1ª operação de toda OS
-    nova e cada seguinte quando a anterior termina)."""
+    nova, cada seguinte quando a anterior termina e a interrompida quando a
+    máquina é consertada) e as INTERROMPIDAS (máquina parada)."""
     itens = []
     for op in operacoes:
-        if op['status'] not in ('EXECUTANDO', 'LIBERADO'):
+        if op['status'] not in ('EXECUTANDO', 'LIBERADO', 'INTERROMPIDA'):
             continue
         itens.append({
             'alocacao_id': op['id'], 'os_id': ordem['id'], 'os_numero': ordem['numero'],
@@ -171,6 +172,9 @@ def operacoes_da_fila(ordem, operacoes):
             'status': op['status'], 'maquina': op['maquina_nome'],
             'maquina_parada': op.get('maquina_status') == 'QUEBRADA',
             'planejado_min': op.get('tempo_planejado_min'),
+            # LIBERADO com inicio_real = interrompida por quebra e já consertada: é RETOMADA
+            'retomada': op['status'] == 'LIBERADO' and bool(op.get('inicio_real')),
+            'acumulado_min': op.get('tempo_acumulado_min') or 0,
         })
     return itens
 
@@ -188,8 +192,16 @@ def texto_fila_operacoes(itens, pode_executar=True):
     linhas = ['📋 Fila de produção:']
     for it in itens[:LIMITE_FILA]:
         marca = '🚨' if it.get('prioridade') == 'URGENTE' else '•'
-        situacao = '⚙️ EXECUTANDO' if it['status'] == 'EXECUTANDO' else '🟡 LIBERADA'
-        parada = ' 🔴 máquina parada' if it.get('maquina_parada') else ''
+        if it['status'] == 'INTERROMPIDA':
+            situacao = f"⏸️ INTERROMPIDA ({texto_duracao(it.get('acumulado_min'))} já feitos)"
+        elif it['status'] == 'EXECUTANDO':
+            situacao = '⚙️ EXECUTANDO'
+        elif it.get('retomada'):
+            situacao = f"🟡 LIBERADA para retomar ({texto_duracao(it.get('acumulado_min'))} já feitos)"
+        else:
+            situacao = '🟡 LIBERADA'
+        # INTERROMPIDA já significa máquina parada; nos demais casos só avisa se estiver parada
+        parada = ' 🔴 máquina parada' if it.get('maquina_parada') or it['status'] == 'INTERROMPIDA' else ''
         linhas.append(f"{marca} {it['os_numero']} — OP {it['sequencia']}/{it['total_operacoes']} — "
                       f"{it['maquina']} — {texto_duracao(it.get('planejado_min'))} estimados — {situacao}{parada}")
     if len(itens) > LIMITE_FILA:
@@ -220,13 +232,18 @@ def teclado_fila(itens, role, com_desenho=frozenset(), provisorios=frozenset()):
         return None
     linhas = []
     for it in itens[:LIMITE_FILA]:
-        acao, rotulo = ('c', '✅ Concluir') if it['status'] == 'EXECUTANDO' else ('i', '▶️ Iniciar')
-        linha = [InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
-                                      callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}")]
         botao = botao_desenho(it.get('peca_codigo'), it.get('peca_codigo') in provisorios)
+        linha = []
+        # Operação interrompida: sem Iniciar/Retomar enquanto a máquina não for consertada
+        if it['status'] != 'INTERROMPIDA':
+            acao, rotulo = ('c', '✅ Concluir') if it['status'] == 'EXECUTANDO' else \
+                ('i', '▶️ Retomar' if it.get('retomada') else '▶️ Iniciar')
+            linha.append(InlineKeyboardButton(f"{rotulo} {it['os_numero']} · OP {it['sequencia']}",
+                                              callback_data=f"op:{acao}:{it['alocacao_id']}:{it['os_id']}"))
         if it.get('peca_codigo') in com_desenho and botao:
             linha.append(botao)
-        linhas.append(linha)
+        if linha:
+            linhas.append(linha)
     return InlineKeyboardMarkup(linhas) if linhas else None
 
 
@@ -274,11 +291,16 @@ def texto_busca_os(dados):
 
 def traduzir_erro_acao(erro):
     """Mensagem do backend -> texto legível para quem está no chat."""
+    if 'Operação interrompida' in erro:
+        return (f'⏸️ {erro}. A operação volta a ficar disponível para retomar assim que o '
+                'coordenador registrar o conserto.')
     if 'está parada' in erro:
         return (f'🔴 {erro}. Não dá para iniciar uma operação nela até o conserto ser registrado. '
                 'Fale com a manutenção e tente de novo depois.')
     if 'Permissão negada' in erro:
         return '⛔ Seu papel não permite iniciar ou concluir operações.'
+    if 'ainda não foi retomada' in erro:
+        return 'ℹ️ Essa operação foi interrompida e ainda não foi retomada. Retome-a em /fila antes de concluir.'
     if 'operação anterior' in erro:
         return f'⏳ {erro}. Veja a fila atualizada com /fila.'
     if 'já iniciada' in erro:
@@ -330,6 +352,13 @@ def texto_indicadores(indicadores, estatisticas):
     for m in indicadores.get('maquinas', []):
         if m.get('mttr_min') is not None:
             linhas.append(f"  MTTR {m['nome']}: {m['mttr_min']} min ({m.get('intervencoes_medidas', 0)} medições)")
+    perdida = indicadores.get('producao_perdida_min')
+    if perdida and (perdida.get('total') or indicadores.get('operacoes_interrompidas')):
+        linhas.append(f"🏭 Produção perdida por máquina parada: {texto_duracao(perdida.get('total'))} de expediente, "
+                      f"{indicadores.get('operacoes_interrompidas', 0)} operação(ões) interrompida(s)")
+        for m in perdida.get('por_maquina', []):
+            if m.get('minutos'):
+                linhas.append(f"  {m['nome']}: {texto_duracao(m['minutos'])}")
     od = estatisticas.get('origem_dados') if estatisticas else None
     if od and od.get('demonstracao'):
         linhas.append(f"\n⚠️ Inclui {od['demonstracao']} registro(s) de demonstração, "
@@ -537,8 +566,9 @@ async def _executar_iniciar(query, telegram_id, aid, os_id):
     if erro:
         await query.edit_message_text(traduzir_erro_acao(erro))
         return
-    hora = (dados.get('inicio_real') or '')[11:16]
-    await query.edit_message_text(f"▶️ Operação iniciada{f' às {hora}' if hora else ''}. Bom trabalho!\n"
+    hora = (dados.get('retomada_em') or dados.get('inicio_real') or '')[11:16]
+    verbo = 'retomada' if dados.get('retomada') else 'iniciada'
+    await query.edit_message_text(f"▶️ Operação {verbo}{f' às {hora}' if hora else ''}. Bom trabalho!\n"
                                   'Quando terminar, use /fila e toque em Concluir.')
 
 
@@ -583,13 +613,23 @@ async def acao_operacao(update: Update, context: ContextTypes.DEFAULT_TYPE, quer
         if acao == 'i' and op['status'] == 'EXECUTANDO':
             await query.edit_message_text(traduzir_erro_acao('Operação já iniciada'))
             return
-        if acao == 'c' and op['status'] != 'EXECUTANDO':
+        if acao == 'i' and op['status'] == 'INTERROMPIDA':
             await query.edit_message_text(traduzir_erro_acao(
-                'Operação já concluída' if op['status'] == 'CONCLUIDO' else 'Operação ainda não foi iniciada'))
+                f"Operação interrompida: a máquina {op['maquina_nome']} está parada"))
             return
-        verbo = 'Iniciar' if acao == 'i' else 'Concluir'
+        if acao == 'c' and op['status'] != 'EXECUTANDO':
+            motivo = {'CONCLUIDO': 'Operação já concluída',
+                      'INTERROMPIDA': f"Operação interrompida: a máquina {op['maquina_nome']} está parada",
+                      'LIBERADO': ('Operação ainda não foi retomada' if op.get('inicio_real')
+                                   else 'Operação ainda não foi iniciada')}.get(op['status'], 'Operação ainda não foi iniciada')
+            await query.edit_message_text(traduzir_erro_acao(motivo))
+            return
+        retomada = acao == 'i' and bool(op.get('inicio_real'))
+        verbo = 'Retomar' if retomada else ('Iniciar' if acao == 'i' else 'Concluir')
         texto = (f"{verbo} a OP {op['sequencia']} na {op['maquina_nome']}?\n"
                  f"Estimado: {texto_duracao(op.get('tempo_planejado_min'))}")
+        if retomada:
+            texto += f"\nJá usinado antes da parada: {texto_duracao(op.get('tempo_acumulado_min'))}"
         extra = None
         if acao == 'i':
             peca = _peca_da_os(telegram_id, os_id)

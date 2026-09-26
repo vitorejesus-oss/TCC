@@ -285,3 +285,69 @@ class TestDesenhoProvisorioNoBot:
     def test_aviso_curto_e_claro(self):
         assert 'provisório' in bt.AVISO_PROVISORIO and 'oficial' in bt.AVISO_PROVISORIO
         assert len(bt.AVISO_PROVISORIO) < 120
+
+def _op_ext(id_, seq, status, inicio_real=None, acumulado=0, **kw):
+    return {**_op(id_, seq, status, **kw), 'inicio_real': inicio_real, 'tempo_acumulado_min': acumulado}
+
+
+class TestOperacaoInterrompidaNoBot:
+    def _botoes(self, teclado):
+        return [(b.text, b.callback_data) for linha in teclado.inline_keyboard for b in linha] if teclado else []
+
+    def test_interrompida_aparece_na_fila_com_maquina_parada(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'INTERROMPIDA', '2031-03-10T09:00:00', 42,
+                                                     maquina_status='QUEBRADA')])
+        texto = bt.texto_fila_operacoes(itens)
+        assert 'INTERROMPIDA' in texto and '42min já feitos' in texto and 'máquina parada' in texto
+
+    def test_interrompida_mesmo_sem_o_status_da_maquina_indica_parada(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'INTERROMPIDA', '2031-03-10T09:00:00', 5)])
+        assert 'máquina parada' in bt.texto_fila_operacoes(itens)
+
+    def test_interrompida_nao_oferece_iniciar_nem_concluir(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'INTERROMPIDA', '2031-03-10T09:00:00', 5)])
+        assert self._botoes(bt.teclado_fila(itens, 'operador')) == []
+
+    def test_interrompida_mantem_o_botao_de_desenho(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'INTERROMPIDA', '2031-03-10T09:00:00', 5)])
+        botoes = self._botoes(bt.teclado_fila(itens, 'operador', com_desenho=frozenset({'40-091799'})))
+        assert botoes == [('📄 Desenho', 'dw:40-091799')]
+
+    def test_liberada_apos_conserto_vira_retomar(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'LIBERADO', '2031-03-10T09:00:00', 42)])
+        assert itens[0]['retomada'] is True
+        assert 'liberada para retomar' in bt.texto_fila_operacoes(itens).lower() or 'LIBERADA para retomar' in bt.texto_fila_operacoes(itens)
+        assert self._botoes(bt.teclado_fila(itens, 'operador')) == [('▶️ Retomar OS-2026-0007 · OP 1', 'op:i:1:7')]
+
+    def test_liberada_de_primeira_execucao_continua_sendo_iniciar(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'LIBERADO')])
+        assert itens[0]['retomada'] is False
+        assert self._botoes(bt.teclado_fila(itens, 'operador'))[0][0].startswith('▶️ Iniciar')
+
+    def test_executando_continua_com_concluir(self):
+        itens = bt.operacoes_da_fila(ORDEM, [_op_ext(1, 1, 'EXECUTANDO', '2031-03-10T09:00:00')])
+        assert self._botoes(bt.teclado_fila(itens, 'operador'))[0][0].startswith('✅ Concluir')
+
+    def test_erro_de_operacao_interrompida_e_legivel(self):
+        texto = bt.traduzir_erro_acao('Operação interrompida: a máquina Torno Horizontal está parada. '
+                                      'Aguarde o conserto para retomar')
+        assert 'Torno Horizontal' in texto and 'conserto' in texto and 'Erro' not in texto
+
+    def test_erro_de_concluir_sem_retomar_e_legivel(self):
+        texto = bt.traduzir_erro_acao('Operação ainda não foi retomada. Inicie-a de novo antes de concluir')
+        assert 'retom' in texto.lower()
+
+    def test_indicadores_mostram_producao_perdida_quando_ha(self):
+        texto = bt.texto_indicadores({
+            'disponibilidade_percentual': 87.5, 'paradas': 1, 'total': 8, 'maquinas': [],
+            'producao_perdida_min': {'total': 135, 'por_maquina': [
+                {'nome': 'Torno Horizontal', 'minutos': 135}, {'nome': 'Serra de Fita', 'minutos': 0}]},
+            'operacoes_interrompidas': 2}, None)
+        assert 'Produção perdida' in texto and '2h15min' in texto and '2 operação(ões) interrompida(s)' in texto
+        assert 'Torno Horizontal: 2h15min' in texto and 'Serra de Fita' not in texto
+
+    def test_indicadores_sem_producao_perdida_nao_poluem_a_mensagem(self):
+        texto = bt.texto_indicadores({
+            'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': [],
+            'producao_perdida_min': {'total': 0, 'por_maquina': []}, 'operacoes_interrompidas': 0}, None)
+        assert 'Produção perdida' not in texto

@@ -329,9 +329,31 @@ def init_db():
         # duração planejada em minutos de trabalho. fim - início não serve mais:
         # uma operação que atravessa a noite tem fim - início > duração.
         ('tempo_planejado_min', 'INTEGER'),
+        # Etapa 3A: máquina que quebra interrompe a operação em execução.
+        # tempo_acumulado_min = minutos de usinagem já feitos antes de uma
+        # interrupção; retomada_em = quando a execução ATUAL começou (inicio_real
+        # continua sendo a primeira vez que a operação começou).
+        ('tempo_acumulado_min', 'INTEGER'),
+        ('retomada_em', 'TIMESTAMP'),
     ]:
         if coluna not in colunas_alocacao:
             c.execute(f'ALTER TABLE alocacao_maquinas ADD COLUMN {coluna} {tipo_sql}')
+
+    # Uma linha por interrupção (uma operação pode ser interrompida mais de
+    # uma vez). fim NULL = máquina ainda parada.
+    c.execute('''CREATE TABLE IF NOT EXISTS paradas_operacao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alocacao_id INTEGER NOT NULL,
+        maquina_id INTEGER NOT NULL,
+        inicio TIMESTAMP NOT NULL,
+        fim TIMESTAMP,
+        relatorio_manutencao_id INTEGER,
+        criado_em TIMESTAMP DEFAULT (datetime('now','localtime')),
+        FOREIGN KEY(alocacao_id) REFERENCES alocacao_maquinas(id),
+        FOREIGN KEY(maquina_id) REFERENCES maquinas(id)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_paradas_alocacao ON paradas_operacao(alocacao_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_paradas_maquina ON paradas_operacao(maquina_id)')
 
     # --- Fase 1: duração de cada intervenção de manutenção -------------------
     c.execute("PRAGMA table_info(relatorios_manutencao)")
@@ -1119,6 +1141,77 @@ def somar_expediente(inicio, minutos):
         t = proxima_abertura(t.date())
 
 
+def minutos_de_expediente(inicio, fim):
+    """Minutos de EXPEDIENTE entre `inicio` e `fim` (datetimes).
+
+    Só conta o que cai entre a abertura e o fechamento de dias úteis
+    (eh_dia_util / abertura_do_dia / fechamento_do_dia): uma máquina parada de
+    madrugada, no fim de semana ou num feriado não representa produção
+    perdida. É o inverso de somar_expediente. 0 se fim <= inicio.
+    """
+    if fim <= inicio:
+        return 0
+    total = timedelta(0)
+    dia = inicio.date()
+    while dia <= fim.date():
+        if eh_dia_util(dia):
+            ini = max(inicio, abertura_do_dia(dia))
+            fi = min(fim, fechamento_do_dia(dia))
+            if fi > ini:
+                total += fi - ini
+        dia += timedelta(days=1)
+    return int(total.total_seconds() / 60)
+
+
+def _minutos_desde(inicio_str, agora):
+    """Minutos corridos (inteiros) de um timestamp do banco até `agora`; 0 se ilegível."""
+    ini = _parse_ts(inicio_str)
+    return max(int((agora - ini).total_seconds() / 60), 0) if ini else 0
+
+
+def _interromper_operacoes(c, maquina_id, agora):
+    """A máquina quebrou: toda operação EXECUTANDO nela vira INTERROMPIDA.
+
+    Soma em tempo_acumulado_min os minutos corridos da execução atual
+    (desde retomada_em, ou inicio_real na primeira execução) e abre uma linha
+    em paradas_operacao. inicio_real não muda. Devolve as operações afetadas.
+    """
+    afetadas = c.execute('''SELECT am.id, am.sequencia, am.inicio_real, am.retomada_em,
+                                   am.tempo_acumulado_min, os.numero AS os_numero, os.id AS os_id
+                            FROM alocacao_maquinas am
+                            JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                            WHERE am.maquina_id = ? AND am.status = 'EXECUTANDO' ''',
+                         (maquina_id,)).fetchall()
+    resultado = []
+    for a in afetadas:
+        trecho = _minutos_desde(a['retomada_em'] or a['inicio_real'], agora)
+        acumulado = (a['tempo_acumulado_min'] or 0) + trecho
+        c.execute('''UPDATE alocacao_maquinas
+                     SET status = 'INTERROMPIDA', tempo_acumulado_min = ?, retomada_em = NULL
+                     WHERE id = ?''', (acumulado, a['id']))
+        c.execute('''INSERT INTO paradas_operacao (alocacao_id, maquina_id, inicio)
+                     VALUES (?, ?, ?)''', (a['id'], maquina_id, agora.isoformat()))
+        resultado.append({'alocacao_id': a['id'], 'os_id': a['os_id'], 'os_numero': a['os_numero'],
+                          'sequencia': a['sequencia'], 'tempo_acumulado_min': acumulado})
+    return resultado
+
+
+def _liberar_operacoes_interrompidas(c, maquina_id, agora, relatorio_id=None):
+    """A máquina foi consertada: as operações INTERROMPIDAS voltam a LIBERADO
+    (o operador decide quando retomar) e as paradas abertas dela são fechadas."""
+    liberadas = c.execute('''SELECT am.id, am.sequencia, os.numero AS os_numero, os.id AS os_id
+                             FROM alocacao_maquinas am
+                             JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                             WHERE am.maquina_id = ? AND am.status = 'INTERROMPIDA' ''',
+                          (maquina_id,)).fetchall()
+    c.execute('''UPDATE alocacao_maquinas SET status = 'LIBERADO'
+                 WHERE maquina_id = ? AND status = 'INTERROMPIDA' ''', (maquina_id,))
+    c.execute('''UPDATE paradas_operacao SET fim = ?, relatorio_manutencao_id = ?
+                 WHERE maquina_id = ? AND fim IS NULL''', (agora.isoformat(), relatorio_id, maquina_id))
+    return [{'alocacao_id': a['id'], 'os_id': a['os_id'], 'os_numero': a['os_numero'],
+             'sequencia': a['sequencia']} for a in liberadas]
+
+
 def _fim_da_fila(cursor, maquina_id, agora):
     """Quando a máquina fica livre, pelo que já está planejado nela.
 
@@ -1516,13 +1609,20 @@ def get_nota_detalhes(nota_id):
 
     alocacoes = []
     if ordem:
-        c.execute('''SELECT am.sequencia, am.status, am.inicio_planejado, am.fim_planejado,
+        c.execute('''SELECT am.id, am.sequencia, am.status, am.inicio_planejado, am.fim_planejado,
+                            am.inicio_real, am.fim_real, am.tempo_realizado_min,
+                            am.tempo_acumulado_min, am.retomada_em, am.tempo_planejado_min,
                             m.nome as maquina_nome
                      FROM alocacao_maquinas am
                      JOIN maquinas m ON m.id = am.maquina_id
                      WHERE am.ordem_servico_id = ?
                      ORDER BY am.sequencia''', (ordem['id'],))
-        alocacoes = [dict(row) for row in c.fetchall()]
+        agora = datetime.now()
+        for row in c.fetchall():
+            aloc = dict(row)
+            aloc['paradas'] = _paradas_da_alocacao(c, aloc['id'], agora)
+            aloc.update(_tempos_da_operacao(aloc, aloc['paradas'], agora))
+            alocacoes.append(aloc)
 
     c.execute('''SELECT tipo_evento, entidade, descricao, usuario, criado_em
                  FROM auditoria WHERE entidade = 'NOTA' AND entidade_id = ?
@@ -1775,7 +1875,7 @@ def get_ordens():
     c.execute(f'''SELECT os.*, n.numero AS nota_numero, n.peca_codigo, p.nome AS peca_nome,
                          n.solicitante, n.origem,
                          (SELECT m.nome FROM alocacao_maquinas a JOIN maquinas m ON m.id = a.maquina_id
-                           WHERE a.ordem_servico_id = os.id AND a.status IN ('EXECUTANDO', 'LIBERADO')
+                           WHERE a.ordem_servico_id = os.id AND a.status IN ('EXECUTANDO', 'LIBERADO', 'INTERROMPIDA')
                            ORDER BY CASE a.status WHEN 'EXECUTANDO' THEN 0 ELSE 1 END, a.sequencia
                            LIMIT 1) AS maquina_atual,
                          (SELECT SUM(a.tempo_planejado_min) FROM alocacao_maquinas a
@@ -1862,9 +1962,9 @@ def iniciar_ordem(os_id):
                  ('USINANDO', tempo_agora.isoformat(), os_id))
 
         c.execute('''UPDATE alocacao_maquinas
-                    SET status = ?, inicio_real = ?, operador = ?
+                    SET status = ?, inicio_real = ?, retomada_em = ?, operador = ?
                     WHERE ordem_servico_id = ? AND sequencia = 1''',
-                 ('EXECUTANDO', tempo_agora.isoformat(), email, os_id))
+                 ('EXECUTANDO', tempo_agora.isoformat(), tempo_agora.isoformat(), email, os_id))
 
         conn.commit()
         registrar_auditoria('INICIO', 'ORDEM_SERVICO', os_id, 'Execução iniciada', usuario=email)
@@ -1877,6 +1977,40 @@ def iniciar_ordem(os_id):
     finally:
         conn.close()
 
+def _paradas_da_alocacao(c, alocacao_id, agora):
+    """Interrupções de uma operação, em ordem: início, fim (None se a máquina
+    ainda está parada), duração em minutos corridos e em minutos de
+    EXPEDIENTE (a que representa produção perdida). Parada aberta conta até gora."""
+    paradas = []
+    for r in c.execute('''SELECT id, inicio, fim FROM paradas_operacao
+                          WHERE alocacao_id = ? ORDER BY inicio''', (alocacao_id,)):
+        ini, fim = _parse_ts(r['inicio']), _parse_ts(r['fim'])
+        ate = fim or agora
+        paradas.append({
+            'id': r['id'], 'inicio': r['inicio'], 'fim': r['fim'], 'aberta': fim is None,
+            'duracao_min': max(int((ate - ini).total_seconds() / 60), 0) if ini else 0,
+            'expediente_min': minutos_de_expediente(ini, ate) if ini else 0,
+        })
+    return paradas
+
+
+def _tempos_da_operacao(op, paradas, agora):
+    """tempo_usinagem_min (só máquina rodando), tempo parado (corrido e de
+    expediente) de uma operação. op traz status, tempo_acumulado_min,
+    retomada_em, inicio_real e tempo_realizado_min."""
+    if op.get('tempo_realizado_min') is not None and op.get('status') == 'CONCLUIDO':
+        usinagem = op['tempo_realizado_min']
+    elif op.get('inicio_real'):
+        usinagem = op.get('tempo_acumulado_min') or 0
+        if op.get('status') == 'EXECUTANDO':
+            usinagem += _minutos_desde(op.get('retomada_em') or op['inicio_real'], agora)
+    else:
+        usinagem = None
+    return {'tempo_usinagem_min': usinagem,
+            'tempo_parado_min': sum(p['duracao_min'] for p in paradas),
+            'tempo_parado_expediente_min': sum(p['expediente_min'] for p in paradas)}
+
+
 @app.route('/api/ordens-servico/<int:os_id>/operacoes', methods=['GET'])
 def get_operacoes_os(os_id):
     """Operações de uma OS com planejado x realizado."""
@@ -1886,14 +2020,18 @@ def get_operacoes_os(os_id):
                         am.inicio_planejado, am.fim_planejado, am.tempo_planejado_min,
                         am.inicio_real, am.fim_real,
                         am.tempo_realizado_min, am.operador, am.observacao,
+                        am.tempo_acumulado_min, am.retomada_em,
                         m.nome AS maquina_nome, m.status AS maquina_status
                  FROM alocacao_maquinas am
                  JOIN maquinas m ON m.id = am.maquina_id
                  WHERE am.ordem_servico_id = ?
                  ORDER BY am.sequencia''', (os_id,))
     operacoes = []
+    agora = datetime.now()
     for row in c.fetchall():
         op = dict(row)
+        op['paradas'] = _paradas_da_alocacao(c, op['id'], agora)
+        op.update(_tempos_da_operacao(op, op['paradas'], agora))
 
         # Tempo planejado é a duração gravada no planejamento (minutos de
         # trabalho): com expediente, fim - início inclui a noite. Só linhas
@@ -1970,6 +2108,7 @@ def get_programacao():
                         am.inicio_planejado, am.fim_planejado,
                         am.inicio_real, am.fim_real,
                         am.tempo_realizado_min, am.operador,
+                        am.tempo_acumulado_min, am.retomada_em,
                         os.id AS os_id, os.numero AS os_numero,
                         os.prioridade,
                         n.id AS nota_id, n.origem AS nota_origem,
@@ -1980,6 +2119,10 @@ def get_programacao():
                  LEFT JOIN pecas p ON p.codigo = n.peca_codigo
                  ORDER BY am.maquina_id, am.inicio_planejado''')
     todas = [dict(r) for r in c.fetchall()]
+    agora_dt = datetime.now()
+    paradas_por_aloc = {}
+    for r in c.execute('SELECT alocacao_id, inicio, fim FROM paradas_operacao ORDER BY inicio'):
+        paradas_por_aloc.setdefault(r['alocacao_id'], []).append(dict(r))
     conn.close()
 
     # O planejado só existe em expediente: num sábado, domingo ou feriado não
@@ -2009,7 +2152,8 @@ def get_programacao():
     janela_fim = fechamento_do_dia(dia.date())
     for a in do_dia:
         ini_r = _parse_ts(a['inicio_real'])
-        fim_r = _parse_ts(a['fim_real']) or ini_r
+        # (operação com paradas ainda não concluída: o realizado chega até agora)
+        fim_r = _parse_ts(a['fim_real']) or (agora_dt if paradas_por_aloc.get(a['id']) else ini_r)
         # A operação pode estar no dia só pelo planejado e ter sido executada
         # em outro: essa execução não conta para o eixo deste dia.
         if not ini_r or not (ini_r < dia_fim and fim_r >= dia_inicio):
@@ -2064,7 +2208,17 @@ def get_programacao():
         for a in alocs:
             planejado = (faixa(a['inicio_planejado'], a['fim_planejado'])
                          if planejado_no_dia else None)
-            realizado = faixa(a['inicio_real'], a['fim_real'] or a['inicio_real'])
+            # Operação com paradas (Etapa 3A) e ainda não concluída: o realizado
+            # vai de inicio_real até agora, e cada trecho parado é desenhado à parte.
+            paradas_op = paradas_por_aloc.get(a['id'], [])
+            realizado = faixa(a['inicio_real'],
+                              a['fim_real'] or (agora_dt.isoformat() if paradas_op else a['inicio_real']))
+            faixas_paradas = []
+            for pa in paradas_op:
+                f = faixa(pa['inicio'], pa['fim'] or agora_dt.isoformat())
+                if f:
+                    f['aberta'] = pa['fim'] is None
+                    faixas_paradas.append(f)
 
             barras.append({
                 'alocacao_id': a['id'],
@@ -2079,6 +2233,8 @@ def get_programacao():
                 'planejado': planejado,
                 'realizado': realizado,
                 'tempo_realizado_min': a['tempo_realizado_min'],
+                'tempo_acumulado_min': a['tempo_acumulado_min'],
+                'paradas': faixas_paradas,
             })
 
         # Conflito: duas operações planejadas na mesma máquina com horário
@@ -2165,8 +2321,18 @@ def iniciar_alocacao(alocacao_id):
 
         if not aloc:
             return jsonify({'erro': 'Operação não encontrada'}), 404
+        # Uma operação que já começou só pode ser iniciada de novo se foi
+        # interrompida por quebra e a máquina já foi consertada (LIBERADO): é
+        # uma RETOMADA, que preserva inicio_real e o tempo já acumulado.
         if aloc['inicio_real']:
-            return jsonify({'erro': 'Operação já iniciada'}), 400
+            if aloc['status'] == 'INTERROMPIDA':
+                return jsonify({
+                    'erro': f"Operação interrompida: a máquina {aloc['maquina_nome']} está parada. "
+                            f"Aguarde o conserto para retomar"
+                }), 409
+            if aloc['status'] != 'LIBERADO':
+                return jsonify({'erro': 'Operação já iniciada'}), 400
+        retomada = bool(aloc['inicio_real'])
         # Sequência de fabricação: só começa depois que a anterior terminou.
         if aloc['sequencia'] > 1:
             anterior = c.execute('''SELECT status FROM alocacao_maquinas
@@ -2183,9 +2349,14 @@ def iniciar_alocacao(alocacao_id):
             }), 409
 
         agora = datetime.now().isoformat()
-        c.execute('''UPDATE alocacao_maquinas
-                     SET status = 'EXECUTANDO', inicio_real = ?, operador = ?
-                     WHERE id = ?''', (agora, email, alocacao_id))
+        if retomada:
+            c.execute('''UPDATE alocacao_maquinas
+                         SET status = 'EXECUTANDO', retomada_em = ?
+                         WHERE id = ?''', (agora, alocacao_id))
+        else:
+            c.execute('''UPDATE alocacao_maquinas
+                         SET status = 'EXECUTANDO', inicio_real = ?, retomada_em = ?, operador = ?
+                         WHERE id = ?''', (agora, agora, email, alocacao_id))
         # Iniciar a 1ª operação é iniciar a OS (o que /ordens-servico/<id>/iniciar
         # já faz): sem isto a OS ficava em PLANEJAMENTO com a operação rodando.
         if aloc['sequencia'] == 1:
@@ -2196,9 +2367,10 @@ def iniciar_alocacao(alocacao_id):
         conn.commit()
 
         registrar_auditoria(
-            'OPERACAO_INICIADA', 'ALOCACAO', alocacao_id,
-            f"OP {aloc['sequencia']} da {aloc['os_numero']} iniciada por {email} "
-            f"na {aloc['maquina_nome']}",
+            'OPERACAO_RETOMADA' if retomada else 'OPERACAO_INICIADA', 'ALOCACAO', alocacao_id,
+            f"OP {aloc['sequencia']} da {aloc['os_numero']} {'retomada' if retomada else 'iniciada'} por {email} "
+            f"na {aloc['maquina_nome']}"
+            + (f" ({aloc['tempo_acumulado_min'] or 0} min de usinagem já feitos)" if retomada else ''),
             usuario=email
         )
 
@@ -2208,9 +2380,11 @@ def iniciar_alocacao(alocacao_id):
             'sequencia': aloc['sequencia'],
             'maquina': aloc['maquina_nome'],
             'operador': email,
+            'retomada': retomada,
         })
 
-        return jsonify({'status': 'ok', 'inicio_real': agora}), 200
+        return jsonify({'status': 'ok', 'inicio_real': aloc['inicio_real'] or agora,
+                        'retomada_em': agora, 'retomada': retomada}), 200
 
     except Exception as e:
         conn.rollback()
@@ -2252,13 +2426,21 @@ def concluir_alocacao(alocacao_id):
             return jsonify({'erro': 'Operação já concluída'}), 400
         if not aloc['inicio_real']:
             return jsonify({'erro': 'Operação ainda não foi iniciada'}), 400
+        if aloc['status'] == 'INTERROMPIDA':
+            return jsonify({'erro': f"Operação interrompida: a máquina {aloc['maquina_nome']} está parada. "
+                                    f"Aguarde o conserto e retome a operação antes de concluir"}), 409
+        if aloc['status'] == 'LIBERADO':
+            return jsonify({'erro': 'Operação ainda não foi retomada. Inicie-a de novo antes de concluir'}), 409
 
         agora = datetime.now()
 
+        # Tempo de usinagem = o que já estava acumulado antes de interrupções
+        # + a execução atual (desde retomada_em; inicio_real nas linhas de
+        # antes da Etapa 3A). O tempo de máquina parada fica de fora.
         realizado = None
         try:
-            inicio = datetime.fromisoformat(aloc['inicio_real'])
-            realizado = int((agora - inicio).total_seconds() / 60)
+            inicio = datetime.fromisoformat(aloc['retomada_em'] or aloc['inicio_real'])
+            realizado = (aloc['tempo_acumulado_min'] or 0) + int((agora - inicio).total_seconds() / 60)
         except (ValueError, TypeError):
             realizado = None
 
@@ -2408,13 +2590,22 @@ def marcar_maquina_quebrada(maquina_id):
         conn.close()
         return jsonify({'erro': 'Máquina não encontrada'}), 404
 
-    momento_quebra = datetime.now().isoformat()
+    agora = datetime.now()
+    momento_quebra = agora.isoformat()
     c.execute("UPDATE maquinas SET status = 'QUEBRADA', quebrada_em = ? WHERE id = ?",
               (momento_quebra, maquina_id))
+    # A operação que estava EXECUTANDO nesta máquina para de contar tempo de usinagem.
+    interrompidas = _interromper_operacoes(c, maquina_id, agora)
     conn.commit()
     conn.close()
 
     registrar_auditoria('MAQUINA_QUEBRADA', 'MAQUINA', maquina_id, f'Máquina marcada como quebrada por {email}', usuario=email)
+    for op in interrompidas:
+        registrar_auditoria(
+            'OPERACAO_INTERROMPIDA', 'ALOCACAO', op['alocacao_id'],
+            f"OP {op['sequencia']} da {op['os_numero']} interrompida: {maquina['nome']} quebrou "
+            f"({op['tempo_acumulado_min']} min de usinagem já feitos)", usuario=email)
+        socketio.emit('operacao_interrompida', {**op, 'maquina': maquina['nome']})
 
     socketio.emit('maquina_quebrada', {
         'id': maquina_id,
@@ -2479,10 +2670,19 @@ def marcar_maquina_consertada(maquina_id):
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (maquina_id, email, relatorio,
                maquina['quebrada_em'], tempo_reparo, agora.isoformat()))
+    relatorio_id = c.lastrowid
+    # Operações interrompidas voltam a LIBERADO; NÃO retomam sozinhas.
+    liberadas = _liberar_operacoes_interrompidas(c, maquina_id, agora, relatorio_id)
     conn.commit()
     conn.close()
 
     registrar_auditoria('MAQUINA_CONSERTADA', 'MAQUINA', maquina_id, f'Máquina consertada por {email}: {relatorio}', usuario=email)
+    for op in liberadas:
+        registrar_auditoria(
+            'OPERACAO_LIBERADA', 'ALOCACAO', op['alocacao_id'],
+            f"OP {op['sequencia']} da {op['os_numero']} liberada para retomada: {maquina['nome']} consertada",
+            usuario=email)
+        socketio.emit('operacao_liberada', {**op, 'maquina': maquina['nome']})
 
     socketio.emit('maquina_consertada', {
         'id': maquina_id,
@@ -3019,13 +3219,24 @@ def indicadores_manutencao():
 
     Query string:
         origem=REAL|DEMONSTRACAO|TODAS  (padrão TODAS)
+        de / ate=YYYY-MM-DD  período das paradas de operação (pelo início da parada)
 
     O filtro fica no ON do LEFT JOIN: toda máquina continua listada, só as
     intervenções contadas mudam.
+
+    Produção perdida (Etapa 3A): minutos de EXPEDIENTE em que operações ficaram
+    interrompidas por máquina quebrada (paradas_operacao). Parada de madrugada,
+    fim de semana ou feriado não conta. Parada ainda aberta conta até agora.
     """
     origem, erro = _origem_da_requisicao()
     if erro:
         return erro
+    de, erro = _data_param('de')
+    if erro:
+        return jsonify({'erro': erro}), 400
+    ate, erro = _data_param('ate', fim_do_dia=True)
+    if erro:
+        return jsonify({'erro': erro}), 400
     filtro, params = _sql_origem(origem, 'r.origem')
 
     conn = get_db()
@@ -3059,6 +3270,36 @@ def indicadores_manutencao():
         item['parada_ha_min'] = parada_ha_min
         resultado.append(item)
 
+    # --- Produção perdida: paradas de operação do período, em minutos de expediente
+    onde_p, params_p = [], []
+    sql_o, params_o = _sql_origem(origem, 'n.origem')
+    if sql_o:
+        onde_p.append(sql_o)
+        params_p += list(params_o)
+    if de:
+        onde_p.append('p.inicio >= ?')
+        params_p.append(de)
+    if ate:
+        onde_p.append('p.inicio < ?')
+        params_p.append(ate)
+    c.execute(f'''SELECT p.alocacao_id, p.maquina_id, p.inicio, p.fim
+                  FROM paradas_operacao p
+                  JOIN alocacao_maquinas am ON am.id = p.alocacao_id
+                  JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                  JOIN notas n ON n.id = os.nota_id
+                  {('WHERE ' + ' AND '.join(onde_p)) if onde_p else ''}''', params_p)
+    perdido, interrompidas, todas_interrompidas = {}, {}, set()
+    for pr in c.fetchall():
+        ini, fim = _parse_ts(pr['inicio']), _parse_ts(pr['fim'])
+        if not ini:
+            continue
+        perdido[pr['maquina_id']] = perdido.get(pr['maquina_id'], 0) + minutos_de_expediente(ini, fim or agora)
+        interrompidas.setdefault(pr['maquina_id'], set()).add(pr['alocacao_id'])
+        todas_interrompidas.add(pr['alocacao_id'])
+    for item in resultado:
+        item['producao_perdida_min'] = perdido.get(item['id'], 0)
+        item['operacoes_interrompidas'] = len(interrompidas.get(item['id'], ()))
+
     total = len(resultado)
     paradas = sum(1 for m in resultado if m['status'] == 'QUEBRADA')
 
@@ -3070,6 +3311,13 @@ def indicadores_manutencao():
         'total': total,
         'paradas': paradas,
         'disponibilidade_percentual': round((total - paradas) / total * 100, 1) if total else None,
+        'producao_perdida_min': {
+            'total': sum(perdido.values()),
+            'por_maquina': [{'maquina_id': m['id'], 'nome': m['nome'], 'minutos': m['producao_perdida_min']}
+                            for m in resultado],
+        },
+        'operacoes_interrompidas': len(todas_interrompidas),
+        'periodo': {'de': de[:10] if de else None, 'ate': request.args.get('ate') or None},
         'origem_dados': origem_dados,
     })
 

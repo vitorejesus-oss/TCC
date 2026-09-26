@@ -960,3 +960,28 @@ input::placeholder, textarea::placeholder { color: #8A97A6; }
 .paginacao select { padding: 6px 8px; border: 1px solid var(--cinza-borda); border-radius: var(--raio); }
 
 .aviso-provisorio { margin-top: 8px; padding: 8px 12px; background: #FFF6E0; border: 1px solid #F0D9A0; border-radius: var(--raio); color: #7A5A00; font-size: 12.5px; }
+
+/* ---------------------------------- operação interrompida por máquina parada -- */
+
+.prog-barra.interrompida {
+  background: repeating-linear-gradient(-45deg, #B3261E 0 6px, #7F1D18 6px 12px);
+  border: 1px solid #7F1D18;
+}
+
+/* trecho em que a máquina esteve parada: vermelho cheio sobre a faixa do realizado */
+.prog-barra-parada {
+  position: absolute;
+  top: 31px;
+  height: 7px;
+  z-index: 3;
+  background: #B3261E;
+  border-radius: 1px;
+}
+
+.prog-interrompida-leg {
+  background: repeating-linear-gradient(-45deg, #B3261E 0 3px, #7F1D18 3px 6px);
+  border: 1px solid #7F1D18;
+}
+.prog-parada-leg { background: #B3261E; }
+
+.aviso-parada { color: #B3261E; }
