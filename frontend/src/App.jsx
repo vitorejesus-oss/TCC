@@ -647,11 +647,19 @@ function ModalVerMais({ notaId, token, onClose }) {
                           )}
                         </div>
                       )}
+                      {a.possivelmente_esquecida && (
+                        <div className="aviso-provisorio" data-testid="possivelmente-esquecida">
+                          ⚠️ Possivelmente esquecida em aberto: {formatarMin(a.tempo_usinagem_min)} de usinagem para{' '}
+                          {formatarMin(a.tempo_planejado_min)} planejados (limite: {formatarMin(a.limite_esquecida_min)}).
+                          Confira e conclua se já terminou.
+                        </div>
+                      )}
                       {a.fora_do_expediente && (
                         <div className="aviso-provisorio" data-testid="fora-do-expediente">
                           ⚠️ Execução fora do expediente: {formatarMin(a.tempo_usinagem_corrido_min)} corridos para{' '}
                           {formatarMin(a.tempo_usinagem_min)} de expediente ({formatarMin(a.fora_do_expediente_min)} fora
                           do horário: hora extra ou operação deixada em aberto).
+                          {a.excluida_dos_indicadores && ' Esta operação fica fora do tempo médio e do desvio.'}
                         </div>
                       )}
                       {(a.paradas || []).map((p, j) => (
@@ -1138,6 +1146,7 @@ function PainelProgramacao({ socket }) {
             <span><i style={{ background: corStatus.EXECUTANDO }} /> Executando</span>
             <span><i style={{ background: corStatus.CONCLUIDO }} /> Concluído</span>
             <span><i className="prog-interrompida-leg" /> Interrompida (máquina parada)</span>
+            <span><i className="prog-esquecida-leg" /> ⚠ Possivelmente esquecida em aberto</span>
             <span><i className="prog-hachura" /> Realizado</span>
             <span><i className="prog-parada-leg" /> Trecho parado</span>
           </div>
@@ -1183,7 +1192,7 @@ function PainelProgramacao({ socket }) {
                       {b.planejado && (
                         <button
                           type="button"
-                          className={`prog-barra ${foco === b.alocacao_id ? 'foco' : ''} ${b.status === 'INTERROMPIDA' ? 'interrompida' : ''}`}
+                          className={`prog-barra ${foco === b.alocacao_id ? 'foco' : ''} ${b.status === 'INTERROMPIDA' ? 'interrompida' : ''} ${b.possivelmente_esquecida ? 'esquecida' : ''}`}
                           style={{
                             left: `${b.planejado.esquerda_pct}%`,
                             width: `${b.planejado.largura_pct}%`,
@@ -1194,9 +1203,9 @@ function PainelProgramacao({ socket }) {
                           onClick={() =>
                             setFoco(foco === b.alocacao_id ? null : b.alocacao_id)
                           }
-                          title={`${b.os_numero} · OP ${b.sequencia} · ${b.planejado.inicio}–${b.planejado.fim}`}
+                          title={`${b.os_numero} · OP ${b.sequencia} · ${b.planejado.inicio}–${b.planejado.fim}${b.possivelmente_esquecida ? ' · possivelmente esquecida em aberto' : ''}`}
                         >
-                          <span>{b.os_numero}</span>
+                          <span>{b.possivelmente_esquecida ? '⚠ ' : ''}{b.os_numero}</span>
                         </button>
                       )}
 
@@ -1250,6 +1259,12 @@ function PainelProgramacao({ socket }) {
                     : '— ainda não medido'}
                 </p>
                 <p><strong>Operador:</strong> {b.operador || '—'}</p>
+                {b.possivelmente_esquecida && (
+                  <p className="aviso-provisorio">
+                    ⚠️ Possivelmente esquecida em aberto: está EXECUTANDO há muito mais que o planejado.
+                    Confira no chão de fábrica e conclua se já terminou.
+                  </p>
+                )}
                 {b.status === 'INTERROMPIDA' && (
                   <p style={{ color: 'var(--vermelho)' }}>
                     <strong>Interrompida:</strong> a máquina quebrou; {b.tempo_acumulado_min ?? 0} min de usinagem
@@ -1930,9 +1945,25 @@ export default function SistemaAutomacao() {
         <AvisoOrigemDados origemDados={estatisticas.origem_dados} />
 
         <h3>Desempenho por máquina</h3>
+        {estatisticas.operacoes_fora_do_calculo?.total > 0 && (
+          <div className="aviso-provisorio" style={{ marginTop: 0, marginBottom: 12 }} data-testid="fora-do-calculo">
+            ⚠️ {estatisticas.operacoes_fora_do_calculo.total === 1
+              ? '1 operação ficou fora'
+              : `${estatisticas.operacoes_fora_do_calculo.total} operações ficaram fora`} do cálculo do tempo médio e do desvio:{' '}
+            {estatisticas.operacoes_fora_do_calculo.motivo}.
+            <ul style={{ margin: '6px 0 0 18px' }}>
+              {estatisticas.operacoes_fora_do_calculo.operacoes.map((o, i) => (
+                <li key={i}>
+                  {o.os_numero} · OP {o.sequencia} · {o.maquina}: {formatarMin(o.corrido_min)} corridos,{' '}
+                  {formatarMin(o.expediente_min)} de expediente, {formatarMin(o.planejado_min)} planejados
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="tabela-wrapper" style={{ marginBottom: 24 }}>
           <table>
-            <thead><tr><th>Máquina</th><th>Operações</th><th>Tempo planejado (min)</th><th>Tempo realizado (min)</th><th>Operações medidas</th></tr></thead>
+            <thead><tr><th>Máquina</th><th>Operações</th><th>Tempo planejado (min)</th><th>Tempo realizado (min)</th><th>Desvio médio (min)</th><th>Operações medidas</th><th>Fora do cálculo</th></tr></thead>
             <tbody>
               {estatisticas.desempenho_por_maquina.map((m, i) => (
                 <tr key={i}>
@@ -1940,7 +1971,9 @@ export default function SistemaAutomacao() {
                   <td>{m.operacoes}</td>
                   <td>{m.tempo_planejado_medio_min ?? '—'}</td>
                   <td>{m.tempo_realizado_medio_min ?? '—'}</td>
+                  <td>{m.desvio_medio_min ?? '—'}</td>
                   <td>{m.operacoes_medidas}</td>
+                  <td>{m.operacoes_fora_do_calculo || '—'}</td>
                 </tr>
               ))}
             </tbody>

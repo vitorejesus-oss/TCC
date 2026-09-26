@@ -76,6 +76,9 @@ CUSTO_MEDIO_RETRABALHO = float(os.getenv('CUSTO_MEDIO_RETRABALHO', '120.0'))
 FOLGA_MAQUINA_PARADA_MIN = int(os.getenv('FOLGA_MAQUINA_PARADA_MIN', '60'))
 # Execução "fora do expediente": corridos - expediente >= este limite (minutos).
 FORA_EXPEDIENTE_LIMIAR_MIN = int(os.getenv('FORA_EXPEDIENTE_LIMIAR_MIN', '60'))
+# Operação EXECUTANDO cujo tempo de usinagem (expediente) passou de FATOR x o
+# planejado é sinalizada como possivelmente esquecida em aberto.
+OPERACAO_ESQUECIDA_FATOR = float(os.getenv('OPERACAO_ESQUECIDA_FATOR', '2'))
 # Expediente da oficina, de segunda a sexta. O planejador só conta minutos
 # dentro dele (ver somar_expediente).
 EXPEDIENTE_INICIO_H = int(os.getenv('EXPEDIENTE_INICIO_H', '7'))
@@ -1712,7 +1715,7 @@ def get_nota_detalhes(nota_id):
         for row in c.fetchall():
             aloc = dict(row)
             aloc['paradas'] = _paradas_da_alocacao(c, aloc['id'], agora)
-            aloc.update(_tempos_da_operacao(aloc, aloc['paradas'], agora))
+            aloc.update(_tempos_da_operacao(aloc, aloc['paradas'], agora, _planejado_da_operacao(aloc)))
             alocacoes.append(aloc)
 
     c.execute('''SELECT tipo_evento, entidade, descricao, usuario, criado_em
@@ -2068,10 +2071,31 @@ def iniciar_ordem(os_id):
     finally:
         conn.close()
 
+def possivelmente_esquecida(status, usinagem_min, planejado_min):
+    """Operação EXECUTANDO cujo tempo de usinagem já passou de
+    OPERACAO_ESQUECIDA_FATOR x o planejado (ambos em minutos de expediente):
+    quase sempre é operação deixada em aberto, não produção."""
+    return (status == 'EXECUTANDO' and bool(planejado_min) and usinagem_min is not None
+            and usinagem_min > OPERACAO_ESQUECIDA_FATOR * planejado_min)
+
+
+def _planejado_da_operacao(op):
+    """Duração planejada em minutos de trabalho: a gravada no planejamento; só
+    linhas anteriores à coluna caem na diferença fim - início."""
+    planejado = op.get('tempo_planejado_min')
+    if planejado is None and op.get('inicio_planejado') and op.get('fim_planejado'):
+        try:
+            planejado = int((datetime.fromisoformat(op['fim_planejado'])
+                             - datetime.fromisoformat(op['inicio_planejado'])).total_seconds() / 60)
+        except (ValueError, TypeError):
+            planejado = None
+    return planejado
+
+
 def _paradas_da_alocacao(c, alocacao_id, agora):
     """Interrupções de uma operação, em ordem: início, fim (None se a máquina
     ainda está parada), duração em minutos corridos e em minutos de
-    EXPEDIENTE (a que representa produção perdida). Parada aberta conta até gora."""
+    EXPEDIENTE (a que representa produção perdida). Parada aberta conta até agora."""
     paradas = []
     for r in c.execute('''SELECT id, inicio, fim FROM paradas_operacao
                           WHERE alocacao_id = ? ORDER BY inicio''', (alocacao_id,)):
@@ -2085,7 +2109,7 @@ def _paradas_da_alocacao(c, alocacao_id, agora):
     return paradas
 
 
-def _tempos_da_operacao(op, paradas, agora):
+def _tempos_da_operacao(op, paradas, agora, planejado=None):
     """tempo_usinagem_min (só máquina rodando), tempo parado (corrido e de
     expediente) de uma operação. op traz status, tempo_acumulado_min,
     retomada_em, inicio_real e tempo_realizado_min."""
@@ -2104,9 +2128,17 @@ def _tempos_da_operacao(op, paradas, agora):
             corrido += corr
     else:
         usinagem = corrido = None
+    if planejado is None:
+        planejado = _planejado_da_operacao(op)
+    fora = fora_do_expediente(corrido, usinagem)
     return {'tempo_usinagem_min': usinagem,               # minutos de expediente
             'tempo_usinagem_corrido_min': corrido,        # minutos corridos
-            'fora_do_expediente': fora_do_expediente(corrido, usinagem),
+            # EXECUTANDO passou muito do planejado: possivelmente esquecida em aberto
+            'possivelmente_esquecida': possivelmente_esquecida(op.get('status'), usinagem, planejado),
+            'limite_esquecida_min': int(OPERACAO_ESQUECIDA_FATOR * planejado) if planejado else None,
+            # concluída fora do expediente: fica fora do tempo médio e do desvio
+            'excluida_dos_indicadores': op.get('status') == 'CONCLUIDO' and fora,
+            'fora_do_expediente': fora,
             'fora_do_expediente_min': (corrido - usinagem) if fora_do_expediente(corrido, usinagem) else 0,
             'tempo_parado_min': sum(p['duracao_min'] for p in paradas),
             'tempo_parado_expediente_min': sum(p['expediente_min'] for p in paradas)}
@@ -2133,22 +2165,13 @@ def get_operacoes_os(os_id):
     for row in c.fetchall():
         op = dict(row)
         op['paradas'] = _paradas_da_alocacao(c, op['id'], agora)
-        op.update(_tempos_da_operacao(op, op['paradas'], agora))
 
         # Tempo planejado é a duração gravada no planejamento (minutos de
-        # trabalho): com expediente, fim - início inclui a noite. Só linhas
-        # anteriores à coluna caem no intervalo. O realizado só existe se a
-        # operação foi de fato concluída. Os dois campos vão separados de
-        # propósito: a tela precisa poder dizer qual é medido.
-        planejado = op['tempo_planejado_min']
-        if planejado is None and op['inicio_planejado'] and op['fim_planejado']:
-            try:
-                ini = datetime.fromisoformat(op['inicio_planejado'])
-                fim = datetime.fromisoformat(op['fim_planejado'])
-                planejado = int((fim - ini).total_seconds() / 60)
-            except (ValueError, TypeError):
-                planejado = None
-
+        # trabalho): com expediente, fim - início inclui a noite. O realizado
+        # só existe se a operação foi de fato concluída. Os dois campos vão
+        # separados de propósito: a tela precisa poder dizer qual é medido.
+        planejado = _planejado_da_operacao(op)
+        op.update(_tempos_da_operacao(op, op['paradas'], agora, planejado))
         op['tempo_planejado_min'] = planejado
         op['desvio_min'] = (
             op['tempo_realizado_min'] - planejado
@@ -2210,7 +2233,8 @@ def get_programacao():
                         am.inicio_planejado, am.fim_planejado,
                         am.inicio_real, am.fim_real,
                         am.tempo_realizado_min, am.operador,
-                        am.tempo_acumulado_min, am.retomada_em,
+                        am.tempo_acumulado_min, am.retomada_em, am.tempo_planejado_min,
+                        am.tempo_acumulado_corrido_min, am.tempo_realizado_corrido_min,
                         os.id AS os_id, os.numero AS os_numero,
                         os.prioridade,
                         n.id AS nota_id, n.origem AS nota_origem,
@@ -2337,6 +2361,8 @@ def get_programacao():
                 'tempo_realizado_min': a['tempo_realizado_min'],
                 'tempo_acumulado_min': a['tempo_acumulado_min'],
                 'paradas': faixas_paradas,
+                # EXECUTANDO há muito mais que o planejado: possivelmente esquecida em aberto
+                'possivelmente_esquecida': _tempos_da_operacao(a, [], agora_dt)['possivelmente_esquecida'],
             })
 
         # Conflito: duas operações planejadas na mesma máquina com horário
@@ -3265,16 +3291,27 @@ def get_estatisticas():
     conn = get_db()
     c = conn.cursor()
 
+    # Operação concluída FORA DO EXPEDIENTE (minutos corridos excedem os de
+    # expediente em >= FORA_EXPEDIENTE_LIMIAR_MIN) fica de fora do tempo médio e
+    # do desvio: quase sempre é operação deixada em aberto, não produção.
+    excluida = (f'(am.tempo_realizado_corrido_min IS NOT NULL AND am.tempo_realizado_min IS NOT NULL '
+                f'AND am.tempo_realizado_corrido_min - am.tempo_realizado_min >= {int(FORA_EXPEDIENTE_LIMIAR_MIN)})')
+    planejado_sql = '''COALESCE(am.tempo_planejado_min,
+                                  (julianday(am.fim_planejado)
+                                   - julianday(am.inicio_planejado)) * 24 * 60)'''
     c.execute(f'''SELECT m.nome AS maquina,
                         COUNT(am.id) AS operacoes,
                         SUM(CASE WHEN am.fim_real IS NOT NULL THEN 1 ELSE 0 END)
                             AS operacoes_medidas,
-                        ROUND(AVG(COALESCE(am.tempo_planejado_min,
-                                  (julianday(am.fim_planejado)
-                                   - julianday(am.inicio_planejado)) * 24 * 60)), 1)
+                        SUM(CASE WHEN {excluida} THEN 1 ELSE 0 END)
+                            AS operacoes_fora_do_calculo,
+                        ROUND(AVG({planejado_sql}), 1)
                             AS tempo_planejado_medio_min,
-                        ROUND(AVG(am.tempo_realizado_min), 1)
-                            AS tempo_realizado_medio_min
+                        ROUND(AVG(CASE WHEN NOT {excluida} THEN am.tempo_realizado_min END), 1)
+                            AS tempo_realizado_medio_min,
+                        ROUND(AVG(CASE WHEN NOT {excluida} AND am.tempo_realizado_min IS NOT NULL
+                                       THEN am.tempo_realizado_min - {planejado_sql} END), 1)
+                            AS desvio_medio_min
                  FROM alocacao_maquinas am
                  JOIN maquinas m ON m.id = am.maquina_id
                  JOIN ordens_servico os ON os.id = am.ordem_servico_id
@@ -3283,6 +3320,18 @@ def get_estatisticas():
                  GROUP BY m.id, m.nome
                  ORDER BY m.nome''', params)
     desempenho_maquinas = [dict(row) for row in c.fetchall()]
+
+    c.execute(f'''SELECT os.numero AS os_numero, am.sequencia, m.nome AS maquina,
+                        am.tempo_realizado_min AS expediente_min,
+                        am.tempo_realizado_corrido_min AS corrido_min,
+                        {planejado_sql} AS planejado_min
+                 FROM alocacao_maquinas am
+                 JOIN maquinas m ON m.id = am.maquina_id
+                 JOIN ordens_servico os ON os.id = am.ordem_servico_id
+                 JOIN notas n ON n.id = os.nota_id
+                 WHERE {filtro} AND {excluida}
+                 ORDER BY os.numero, am.sequencia''', params)
+    fora_do_calculo = [dict(row) for row in c.fetchall()]
 
     c.execute(f'''SELECT COALESCE(n.solicitante, 'NAO_INFORMADO') as operador,
                         COUNT(*) as total_notas,
@@ -3312,6 +3361,13 @@ def get_estatisticas():
 
     return jsonify({
         'desempenho_por_maquina': desempenho_maquinas,
+        'operacoes_fora_do_calculo': {
+            'total': len(fora_do_calculo),
+            'limiar_min': FORA_EXPEDIENTE_LIMIAR_MIN,
+            'motivo': (f'execução fora do expediente: os minutos corridos passaram os de expediente em pelo menos '
+                       f'{FORA_EXPEDIENTE_LIMIAR_MIN} min (hora extra, fim de semana ou operação deixada em aberto)'),
+            'operacoes': fora_do_calculo,
+        },
         'notas_por_operador': por_operador,
         'economia_semanal': economia_semanal,
         'origem_dados': origem_dados,

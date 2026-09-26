@@ -2077,3 +2077,247 @@ class TestProducaoPerdida:
         for params in ({'de': '10/03/2031'}, {'ate': 'ontem'}):
             r = client.get('/api/indicadores/manutencao', query_string=params, headers=_auth_papel(client, 'gestor'))
             assert r.status_code == 400
+
+class TestOperacaoPossivelmenteEsquecida:
+    """EXECUTANDO há muito mais que o planejado é sinalizada (Programação, bot, Ver Mais)."""
+
+    def test_regra_pura(self):
+        f = app_module.possivelmente_esquecida
+        assert app_module.OPERACAO_ESQUECIDA_FATOR == 2
+        assert f('EXECUTANDO', 301, 150) is True
+        assert f('EXECUTANDO', 300, 150) is False          # exatamente o dobro ainda não sinaliza
+        assert f('CONCLUIDO', 4000, 150) is False           # concluída não é "esquecida"
+        assert f('INTERROMPIDA', 4000, 150) is False
+        assert f('LIBERADO', 4000, 150) is False
+        assert f('EXECUTANDO', 4000, None) is False         # sem planejado não há como comparar
+        assert f('EXECUTANDO', 4000, 0) is False
+        assert f('EXECUTANDO', None, 150) is False
+
+    @pytest.fixture
+    def relogio(self, monkeypatch):
+        class R:
+            agora = datetime(2031, 3, 10, 9, 0)
+        r = R()
+        monkeypatch.setattr(app_module, '_agora', lambda: r.agora)
+        return r
+
+    @staticmethod
+    def _op1_em_execucao(client):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        assert client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=_auth_papel(client, 'operador')).status_code == 200
+        return os_id, ops[0]['id'], ops[0]['tempo_planejado_min']
+
+    def test_operacao_que_passa_do_dobro_e_sinalizada(self, client, relogio):
+        os_id, aloc, planejado = self._op1_em_execucao(client)
+        assert planejado == 120
+        relogio.agora = datetime(2031, 3, 10, 13, 0)                       # 240 min = exatamente o dobro
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['possivelmente_esquecida'] is False and op['limite_esquecida_min'] == 240
+        relogio.agora = datetime(2031, 3, 10, 13, 1)                        # 241 min
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['status'] == 'EXECUTANDO' and op['possivelmente_esquecida'] is True
+
+    def test_fator_e_configuravel(self, client, relogio, monkeypatch):
+        monkeypatch.setattr(app_module, 'OPERACAO_ESQUECIDA_FATOR', 3.0)
+        os_id, aloc, planejado = self._op1_em_execucao(client)
+        relogio.agora = datetime(2031, 3, 10, 15, 30)                       # 390 min > 360 (3x o planejado)
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['limite_esquecida_min'] == 360 and op['possivelmente_esquecida'] is True
+        relogio.agora = datetime(2031, 3, 10, 14, 30)                       # 330 min: dentro de 3x
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['possivelmente_esquecida'] is False
+
+    def test_conta_em_minutos_de_expediente_nao_corridos(self, client, relogio):
+        """Iniciada às 16h e vista às 8h do dia seguinte: 60 + 60 = 120 min de expediente, não é esquecida."""
+        os_id, aloc, _ = self._op1_em_execucao(client)
+        relogio.agora = datetime(2031, 3, 10, 16, 0)
+        conn = app_module.get_db()
+        try:
+            conn.execute('UPDATE alocacao_maquinas SET inicio_real = ?, retomada_em = ? WHERE id = ?',
+                         (relogio.agora.isoformat(), relogio.agora.isoformat(), aloc))
+            conn.commit()
+        finally:
+            conn.close()
+        relogio.agora = datetime(2031, 3, 11, 8, 0)
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['tempo_usinagem_min'] == 120 and op['possivelmente_esquecida'] is False
+
+    def test_interrompida_e_concluida_nao_sao_esquecidas(self, client, relogio):
+        os_id, aloc, _ = self._op1_em_execucao(client)
+        relogio.agora = datetime(2031, 3, 10, 12, 0)
+        r = client.post(f'/api/alocacoes/{aloc}/concluir', headers=_auth_papel(client, 'operador'),
+                        data=json.dumps({}), content_type='application/json')
+        assert r.status_code == 200
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['status'] == 'CONCLUIDO' and op['possivelmente_esquecida'] is False
+
+    def test_programacao_marca_a_barra(self, client, relogio):
+        os_id, aloc, _ = self._op1_em_execucao(client)
+        relogio.agora = datetime(2031, 3, 10, 15, 0)                        # 360 min > 240
+        prog = json.loads(client.get('/api/programacao?data=2031-03-10').data)
+        barra = next(b for m in prog['maquinas'] for b in m['barras'] if b['alocacao_id'] == aloc)
+        assert barra['status'] == 'EXECUTANDO' and barra['possivelmente_esquecida'] is True
+
+    def test_programacao_nao_marca_operacao_dentro_do_prazo(self, client, relogio):
+        os_id, aloc, _ = self._op1_em_execucao(client)
+        relogio.agora = datetime(2031, 3, 10, 10, 0)
+        prog = json.loads(client.get('/api/programacao?data=2031-03-10').data)
+        barra = next(b for m in prog['maquinas'] for b in m['barras'] if b['alocacao_id'] == aloc)
+        assert barra['possivelmente_esquecida'] is False
+
+    def test_ver_mais_traz_a_sinalizacao(self, client, relogio):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        d = json.loads(r.data)
+        ops = json.loads(client.get(f'/api/ordens-servico/{d["processamento"]["os_id"]}/operacoes').data)
+        client.post(f'/api/alocacoes/{ops[0]["id"]}/iniciar', headers=_auth_papel(client, 'operador'))
+        relogio.agora = datetime(2031, 3, 10, 16, 0)                        # 420 min
+        det = json.loads(client.get(f'/api/notas/{d["nota_id"]}/detalhes', headers=_auth_papel(client, 'operador')).data)
+        aloc = det['alocacoes'][0]
+        assert aloc['possivelmente_esquecida'] is True and aloc['limite_esquecida_min'] == 240
+        assert aloc['tempo_planejado_min'] == 120
+
+
+class TestIndicadoresSemForaDoExpediente:
+    """Tempo médio e desvio (Estatísticas) deixam de fora as operações concluídas fora do expediente."""
+
+    SEG = datetime(2031, 3, 10)
+
+    @staticmethod
+    def _inserir(ini, fim, realizado, corrido, planejado=100):
+        conn = app_module.get_db()
+        try:
+            maquina_id = conn.execute("SELECT id FROM maquinas WHERE nome = 'Torno Vertical'").fetchone()[0]
+            os_id = conn.execute('SELECT id FROM ordens_servico ORDER BY id DESC LIMIT 1').fetchone()[0]
+            cur = conn.execute('''INSERT INTO alocacao_maquinas
+                                  (ordem_servico_id, maquina_id, sequencia, status, inicio_real, fim_real,
+                                   tempo_realizado_min, tempo_realizado_corrido_min, tempo_planejado_min)
+                                  VALUES (?, ?, 97, 'CONCLUIDO', ?, ?, ?, ?, ?)''',
+                               (os_id, maquina_id, ini.isoformat(), fim.isoformat(), realizado, corrido, planejado))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _limpar(*ids):
+        conn = app_module.get_db()
+        try:
+            for i in ids:
+                conn.execute('DELETE FROM alocacao_maquinas WHERE id = ?', (i,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _stats(client):
+        r = client.get('/api/estatisticas', headers=_auth_papel(client, 'gestor'))
+        assert r.status_code == 200, r.data
+        return json.loads(r.data)
+
+    @staticmethod
+    def _esperado_do_banco():
+        """Média do realizado e desvio médio do Torno Vertical, recalculados em Python a partir das linhas."""
+        limiar = app_module.FORA_EXPEDIENTE_LIMIAR_MIN
+        conn = app_module.get_db()
+        try:
+            linhas = conn.execute('''SELECT am.tempo_realizado_min r, am.tempo_realizado_corrido_min c,
+                                            COALESCE(am.tempo_planejado_min,
+                                                     (julianday(am.fim_planejado) - julianday(am.inicio_planejado)) * 1440) p
+                                     FROM alocacao_maquinas am JOIN maquinas m ON m.id = am.maquina_id
+                                     WHERE m.nome = 'Torno Vertical' ''').fetchall()
+        finally:
+            conn.close()
+        incluidas = [x for x in linhas if x['r'] is not None and not (x['c'] is not None and x['c'] - x['r'] >= limiar)]
+        media = round(sum(x['r'] for x in incluidas) / len(incluidas), 1) if incluidas else None
+        desvios = [x['r'] - x['p'] for x in incluidas if x['p'] is not None]
+        desvio = round(sum(desvios) / len(desvios), 1) if desvios else None
+        return media, desvio
+
+    def test_operacao_fora_do_expediente_nao_entra_na_media_nem_no_desvio(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']['total']
+        normal = self._inserir(self.SEG.replace(hour=9), self.SEG.replace(hour=10), realizado=60, corrido=60)
+        esquecida = self._inserir(self.SEG + timedelta(days=4, hours=16), self.SEG + timedelta(days=7, hours=8),
+                                  realizado=120, corrido=3840, planejado=100)
+        try:
+            d = self._stats(client)
+            torno = next(m for m in d['desempenho_por_maquina'] if m['maquina'] == 'Torno Vertical')
+            media, desvio = self._esperado_do_banco()
+            assert torno['tempo_realizado_medio_min'] == media
+            assert torno['desvio_medio_min'] == desvio
+            assert torno['operacoes_fora_do_calculo'] >= 1
+            assert d['operacoes_fora_do_calculo']['total'] == antes + 1
+        finally:
+            self._limpar(normal, esquecida)
+
+    def test_sem_a_exclusao_a_media_seria_puxada_para_cima(self, client):
+        """Prova de que a exclusão faz diferença: a operação esquecida tem 10x o tempo da normal."""
+        normal = self._inserir(self.SEG.replace(hour=9), self.SEG.replace(hour=10), realizado=60, corrido=60)
+        base = next(m for m in self._stats(client)['desempenho_por_maquina'] if m['maquina'] == 'Torno Vertical')
+        esquecida = self._inserir(self.SEG + timedelta(days=4, hours=16), self.SEG + timedelta(days=7, hours=8),
+                                  realizado=6000, corrido=9000)
+        try:
+            depois = next(m for m in self._stats(client)['desempenho_por_maquina'] if m['maquina'] == 'Torno Vertical')
+            assert depois['tempo_realizado_medio_min'] == base['tempo_realizado_medio_min']
+            assert depois['desvio_medio_min'] == base['desvio_medio_min']
+        finally:
+            self._limpar(normal, esquecida)
+
+    def test_lista_de_excluidas_traz_os_dados_e_o_motivo(self, client):
+        esquecida = self._inserir(self.SEG + timedelta(days=4, hours=16), self.SEG + timedelta(days=7, hours=8),
+                                  realizado=120, corrido=3847, planejado=100)
+        try:
+            fora = self._stats(client)['operacoes_fora_do_calculo']
+            assert fora['limiar_min'] == app_module.FORA_EXPEDIENTE_LIMIAR_MIN
+            assert 'fora do expediente' in fora['motivo']
+            item = next(o for o in fora['operacoes'] if o['corrido_min'] == 3847)
+            assert item['expediente_min'] == 120 and item['planejado_min'] == 100 and item['maquina'] == 'Torno Vertical'
+            assert {'os_numero', 'sequencia'} <= set(item)
+        finally:
+            self._limpar(esquecida)
+
+    def test_hora_extra_pequena_continua_no_calculo(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']['total']
+        pequena = self._inserir(self.SEG.replace(hour=16, minute=30), self.SEG.replace(hour=17, minute=30),
+                                realizado=30, corrido=60)          # diferença de 30 < 60
+        try:
+            assert self._stats(client)['operacoes_fora_do_calculo']['total'] == antes
+        finally:
+            self._limpar(pequena)
+
+    def test_linha_antiga_sem_corrido_nao_e_excluida(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']['total']
+        conn = app_module.get_db()
+        try:
+            maquina_id = conn.execute("SELECT id FROM maquinas WHERE nome = 'Torno Vertical'").fetchone()[0]
+            os_id = conn.execute('SELECT id FROM ordens_servico ORDER BY id DESC LIMIT 1').fetchone()[0]
+            cur = conn.execute('''INSERT INTO alocacao_maquinas (ordem_servico_id, maquina_id, sequencia, status, tempo_realizado_min)
+                                  VALUES (?, ?, 96, 'CONCLUIDO', 500)''', (os_id, maquina_id))
+            conn.commit()
+            aloc = cur.lastrowid
+        finally:
+            conn.close()
+        try:
+            assert self._stats(client)['operacoes_fora_do_calculo']['total'] == antes
+        finally:
+            self._limpar(aloc)
+
+    def test_operacoes_endpoint_marca_a_excluida(self, client, monkeypatch):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        conn = app_module.get_db()
+        try:
+            conn.execute('''UPDATE alocacao_maquinas SET status='CONCLUIDO', inicio_real='2031-03-14T16:00:00',
+                            fim_real='2031-03-17T08:00:00', tempo_realizado_min=120, tempo_realizado_corrido_min=3840
+                            WHERE id = ?''', (ops[0]['id'],))
+            conn.commit()
+        finally:
+            conn.close()
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['fora_do_expediente'] is True and op['excluida_dos_indicadores'] is True
+        assert op['possivelmente_esquecida'] is False

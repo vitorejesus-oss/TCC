@@ -175,6 +175,9 @@ def operacoes_da_fila(ordem, operacoes):
             # LIBERADO com inicio_real = interrompida por quebra e já consertada: é RETOMADA
             'retomada': op['status'] == 'LIBERADO' and bool(op.get('inicio_real')),
             'acumulado_min': op.get('tempo_acumulado_min') or 0,
+            # EXECUTANDO há muito mais que o planejado (o backend decide pelo fator configurado)
+            'esquecida': bool(op.get('possivelmente_esquecida')),
+            'usinagem_min': op.get('tempo_usinagem_min'),
         })
     return itens
 
@@ -194,6 +197,9 @@ def texto_fila_operacoes(itens, pode_executar=True):
         marca = '🚨' if it.get('prioridade') == 'URGENTE' else '•'
         if it['status'] == 'INTERROMPIDA':
             situacao = f"⏸️ INTERROMPIDA ({texto_duracao(it.get('acumulado_min'))} já feitos)"
+        elif it['status'] == 'EXECUTANDO' and it.get('esquecida'):
+            situacao = (f"⚠️ EXECUTANDO — possivelmente esquecida em aberto "
+                        f"({texto_duracao(it.get('usinagem_min'))} de usinagem para {texto_duracao(it.get('planejado_min'))} planejados)")
         elif it['status'] == 'EXECUTANDO':
             situacao = '⚙️ EXECUTANDO'
         elif it.get('retomada'):
@@ -362,6 +368,10 @@ def texto_indicadores(indicadores, estatisticas):
         for m in perdida.get('por_maquina', []):
             if m.get('minutos'):
                 linhas.append(f"  {m['nome']}: {texto_duracao(m['minutos'])}")
+    fora = (estatisticas or {}).get('operacoes_fora_do_calculo') or {}
+    if fora.get('total'):
+        linhas.append(f"⚠️ {fora['total']} operação(ões) ficaram fora do tempo médio e do desvio "
+                      f"(execução fora do expediente: hora extra ou operação deixada em aberto).")
     od = estatisticas.get('origem_dados') if estatisticas else None
     if od and od.get('demonstracao'):
         linhas.append(f"\n⚠️ Inclui {od['demonstracao']} registro(s) de demonstração, "

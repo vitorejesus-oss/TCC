@@ -985,3 +985,7 @@ input::placeholder, textarea::placeholder { color: #8A97A6; }
 .prog-parada-leg { background: #B3261E; }
 
 .aviso-parada { color: #B3261E; }
+
+/* operação possivelmente esquecida em aberto */
+.prog-barra.esquecida { outline: 2px dashed #B45309; outline-offset: 1px; }
+.prog-esquecida-leg { background: var(--azul-medio); outline: 2px dashed #B45309; outline-offset: -1px; }

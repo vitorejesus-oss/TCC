@@ -365,3 +365,33 @@ class TestConclusaoForaDoExpedienteNoBot:
                                     'fora_do_expediente': False, 'os_concluida': False},
                                    [_op(1, 1, 'CONCLUIDO', planejado=120)], 1)
         assert 'fora do expediente' not in texto
+
+class TestEsquecidaNoBot:
+    def test_fila_marca_a_operacao_possivelmente_esquecida(self):
+        op = {**_op(1, 1, 'EXECUTANDO', planejado=150), 'possivelmente_esquecida': True,
+              'tempo_usinagem_min': 1711}
+        texto = bt.texto_fila_operacoes(bt.operacoes_da_fila(ORDEM, [op]))
+        assert 'possivelmente esquecida em aberto' in texto
+        assert '28h31min de usinagem para 2h30min planejados' in texto
+
+    def test_executando_normal_nao_e_marcada(self):
+        op = {**_op(1, 1, 'EXECUTANDO'), 'possivelmente_esquecida': False, 'tempo_usinagem_min': 30}
+        texto = bt.texto_fila_operacoes(bt.operacoes_da_fila(ORDEM, [op]))
+        assert 'esquecida' not in texto and 'EXECUTANDO' in texto
+
+    def test_marcada_continua_com_o_botao_concluir(self):
+        op = {**_op(1, 1, 'EXECUTANDO'), 'possivelmente_esquecida': True, 'tempo_usinagem_min': 900}
+        teclado = bt.teclado_fila(bt.operacoes_da_fila(ORDEM, [op]), 'operador')
+        assert [b.text for linha in teclado.inline_keyboard for b in linha][0].startswith('✅ Concluir')
+
+    def test_indicadores_informam_as_operacoes_fora_do_calculo(self):
+        texto = bt.texto_indicadores(
+            {'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': []},
+            {'operacoes_fora_do_calculo': {'total': 2}})
+        assert '2 operação(ões) ficaram fora do tempo médio e do desvio' in texto
+
+    def test_indicadores_sem_exclusao_nao_avisam(self):
+        texto = bt.texto_indicadores(
+            {'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': []},
+            {'operacoes_fora_do_calculo': {'total': 0}})
+        assert 'fora do tempo médio' not in texto
