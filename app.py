@@ -74,6 +74,8 @@ CUSTO_HORA_PRODUCAO = float(os.getenv('CUSTO_HORA_PRODUCAO', '45.0'))
 CUSTO_MEDIO_RETRABALHO = float(os.getenv('CUSTO_MEDIO_RETRABALHO', '120.0'))
 # Tempo até uma máquina QUEBRADA voltar, contado a partir de agora ao planejar nela
 FOLGA_MAQUINA_PARADA_MIN = int(os.getenv('FOLGA_MAQUINA_PARADA_MIN', '60'))
+# Execução "fora do expediente": corridos - expediente >= este limite (minutos).
+FORA_EXPEDIENTE_LIMIAR_MIN = int(os.getenv('FORA_EXPEDIENTE_LIMIAR_MIN', '60'))
 # Expediente da oficina, de segunda a sexta. O planejador só conta minutos
 # dentro dele (ver somar_expediente).
 EXPEDIENTE_INICIO_H = int(os.getenv('EXPEDIENTE_INICIO_H', '7'))
@@ -335,6 +337,11 @@ def init_db():
         # continua sendo a primeira vez que a operação começou).
         ('tempo_acumulado_min', 'INTEGER'),
         ('retomada_em', 'TIMESTAMP'),
+        # Unidade do tempo: tempo_realizado_min e tempo_acumulado_min são em
+        # minutos de EXPEDIENTE (mesma régua do planejado); as colunas
+        # *_corrido_min guardam os minutos corridos, para auditoria.
+        ('tempo_realizado_corrido_min', 'INTEGER'),
+        ('tempo_acumulado_corrido_min', 'INTEGER'),
     ]:
         if coluna not in colunas_alocacao:
             c.execute(f'ALTER TABLE alocacao_maquinas ADD COLUMN {coluna} {tipo_sql}')
@@ -435,6 +442,7 @@ def init_db():
                    AND ordem_servico_id IN (SELECT id FROM ordens_servico WHERE status = 'PLANEJAMENTO')''')
 
     conn.commit()
+    _migrar_realizado_para_expediente(conn)
     logger.info("Banco de dados inicializado")
     conn.close()
 
@@ -1141,6 +1149,12 @@ def somar_expediente(inicio, minutos):
         t = proxima_abertura(t.date())
 
 
+def _agora():
+    """Relógio do sistema. Existe para os testes poderem fixar a hora: as
+    contas de expediente (Etapa 3A) dependem de que hora é agora."""
+    return datetime.now()
+
+
 def minutos_de_expediente(inicio, fim):
     """Minutos de EXPEDIENTE entre `inicio` e `fim` (datetimes).
 
@@ -1169,26 +1183,52 @@ def _minutos_desde(inicio_str, agora):
     return max(int((agora - ini).total_seconds() / 60), 0) if ini else 0
 
 
+def _minutos_expediente_desde(inicio_str, agora):
+    """Minutos de EXPEDIENTE de um timestamp do banco até `agora`; 0 se ilegível."""
+    ini = _parse_ts(inicio_str)
+    return minutos_de_expediente(ini, agora) if ini else 0
+
+
+def _trecho(inicio_str, agora):
+    """(expediente, corrido) do trecho de execução que começou em `inicio_str`.
+
+    O realizado e o acumulado ficam em minutos de EXPEDIENTE, a mesma régua do
+    planejado e da produção perdida; os minutos corridos são guardados à parte
+    (auditoria e sinalização de execução fora do expediente)."""
+    return _minutos_expediente_desde(inicio_str, agora), _minutos_desde(inicio_str, agora)
+
+
+def fora_do_expediente(corrido, expediente):
+    """True quando uma parte relevante da execução caiu fora do expediente
+    (hora extra, fim de semana ou operação deixada aberta): corridos maiores
+    que os de expediente por pelo menos FORA_EXPEDIENTE_LIMIAR_MIN minutos."""
+    return corrido is not None and expediente is not None and corrido - expediente >= FORA_EXPEDIENTE_LIMIAR_MIN
+
+
 def _interromper_operacoes(c, maquina_id, agora):
     """A máquina quebrou: toda operação EXECUTANDO nela vira INTERROMPIDA.
 
-    Soma em tempo_acumulado_min os minutos corridos da execução atual
-    (desde retomada_em, ou inicio_real na primeira execução) e abre uma linha
-    em paradas_operacao. inicio_real não muda. Devolve as operações afetadas.
+    Soma em tempo_acumulado_min os minutos de EXPEDIENTE da execução atual
+    (desde retomada_em, ou inicio_real na primeira execução) e em
+    tempo_acumulado_corrido_min os corridos, e abre uma linha em
+    paradas_operacao. inicio_real não muda. Devolve as operações afetadas.
     """
     afetadas = c.execute('''SELECT am.id, am.sequencia, am.inicio_real, am.retomada_em,
-                                   am.tempo_acumulado_min, os.numero AS os_numero, os.id AS os_id
+                                   am.tempo_acumulado_min, am.tempo_acumulado_corrido_min,
+                                   os.numero AS os_numero, os.id AS os_id
                             FROM alocacao_maquinas am
                             JOIN ordens_servico os ON os.id = am.ordem_servico_id
                             WHERE am.maquina_id = ? AND am.status = 'EXECUTANDO' ''',
                          (maquina_id,)).fetchall()
     resultado = []
     for a in afetadas:
-        trecho = _minutos_desde(a['retomada_em'] or a['inicio_real'], agora)
-        acumulado = (a['tempo_acumulado_min'] or 0) + trecho
+        expediente, corrido = _trecho(a['retomada_em'] or a['inicio_real'], agora)
+        acumulado = (a['tempo_acumulado_min'] or 0) + expediente
+        acumulado_corrido = (a['tempo_acumulado_corrido_min'] or 0) + corrido
         c.execute('''UPDATE alocacao_maquinas
-                     SET status = 'INTERROMPIDA', tempo_acumulado_min = ?, retomada_em = NULL
-                     WHERE id = ?''', (acumulado, a['id']))
+                     SET status = 'INTERROMPIDA', tempo_acumulado_min = ?,
+                         tempo_acumulado_corrido_min = ?, retomada_em = NULL
+                     WHERE id = ?''', (acumulado, acumulado_corrido, a['id']))
         c.execute('''INSERT INTO paradas_operacao (alocacao_id, maquina_id, inicio)
                      VALUES (?, ?, ?)''', (a['id'], maquina_id, agora.isoformat()))
         resultado.append({'alocacao_id': a['id'], 'os_id': a['os_id'], 'os_numero': a['os_numero'],
@@ -1210,6 +1250,56 @@ def _liberar_operacoes_interrompidas(c, maquina_id, agora, relatorio_id=None):
                  WHERE maquina_id = ? AND fim IS NULL''', (agora.isoformat(), relatorio_id, maquina_id))
     return [{'alocacao_id': a['id'], 'os_id': a['os_id'], 'os_numero': a['os_numero'],
              'sequencia': a['sequencia']} for a in liberadas]
+
+
+def _migrar_realizado_para_expediente(conn):
+    """Unidade do tempo realizado: de minutos corridos para minutos de EXPEDIENTE.
+
+    Antes desta migração tempo_realizado_min era fim_real - inicio_real em
+    minutos corridos; o planejado sempre foi em expediente. Para cada
+    operação concluída ainda sem tempo_realizado_corrido_min:
+      - o valor gravado vira o corrido (auditoria);
+      - se há inicio_real e fim_real e o cálculo em expediente difere do
+        corrido, tempo_realizado_min é recalculado em expediente. Se nada
+        difere (operação inteira dentro do expediente), o valor não muda.
+    Idempotente (só toca linhas sem a coluna dos corridos). Antes de mudar
+    qualquer valor, faz um backup do banco. Devolve quantas linhas recalculou.
+    """
+    c = conn.cursor()
+    linhas = c.execute('''SELECT am.id, am.inicio_real, am.fim_real, am.tempo_realizado_min,
+                                 (SELECT COUNT(*) FROM paradas_operacao p WHERE p.alocacao_id = am.id) AS n_paradas
+                          FROM alocacao_maquinas am
+                          WHERE am.status = 'CONCLUIDO' AND am.tempo_realizado_min IS NOT NULL
+                            AND am.tempo_realizado_corrido_min IS NULL''').fetchall()
+    recalcular = []
+    for r in linhas:
+        ini, fim = _parse_ts(r['inicio_real']), _parse_ts(r['fim_real'])
+        if ini and fim and fim > ini and not r['n_paradas']:
+            expediente = minutos_de_expediente(ini, fim)
+            if expediente != int((fim - ini).total_seconds() / 60):
+                recalcular.append((r['id'], expediente))
+    acumulados = c.execute('''SELECT id FROM alocacao_maquinas
+                              WHERE tempo_acumulado_min IS NOT NULL AND tempo_acumulado_corrido_min IS NULL''').fetchall()
+    if not linhas and not acumulados:
+        return 0
+    if recalcular:
+        try:
+            criar_backup()
+        except Exception as e:      # sem backup não se recalcula
+            logger.error(f'Migração do tempo realizado adiada: backup falhou ({e})')
+            return 0
+    for r in linhas:
+        c.execute('UPDATE alocacao_maquinas SET tempo_realizado_corrido_min = tempo_realizado_min WHERE id = ?', (r['id'],))
+    for alocacao_id, expediente in recalcular:
+        c.execute('UPDATE alocacao_maquinas SET tempo_realizado_min = ? WHERE id = ?', (expediente, alocacao_id))
+    # acumulado de operação ainda interrompida, gravado antes da coluna dos corridos
+    for r in acumulados:
+        c.execute('UPDATE alocacao_maquinas SET tempo_acumulado_corrido_min = tempo_acumulado_min WHERE id = ?', (r['id'],))
+    conn.commit()
+    if recalcular:
+        logger.info(f'Tempo realizado recalculado em minutos de expediente: {len(recalcular)} operação(ões) '
+                    f"({', '.join(str(a) for a, _ in recalcular)})")
+    return len(recalcular)
 
 
 def _fim_da_fila(cursor, maquina_id, agora):
@@ -1612,12 +1702,13 @@ def get_nota_detalhes(nota_id):
         c.execute('''SELECT am.id, am.sequencia, am.status, am.inicio_planejado, am.fim_planejado,
                             am.inicio_real, am.fim_real, am.tempo_realizado_min,
                             am.tempo_acumulado_min, am.retomada_em, am.tempo_planejado_min,
+                            am.tempo_realizado_corrido_min, am.tempo_acumulado_corrido_min,
                             m.nome as maquina_nome
                      FROM alocacao_maquinas am
                      JOIN maquinas m ON m.id = am.maquina_id
                      WHERE am.ordem_servico_id = ?
                      ORDER BY am.sequencia''', (ordem['id'],))
-        agora = datetime.now()
+        agora = _agora()
         for row in c.fetchall():
             aloc = dict(row)
             aloc['paradas'] = _paradas_da_alocacao(c, aloc['id'], agora)
@@ -1954,7 +2045,7 @@ def iniciar_ordem(os_id):
                 'erro': f"Máquina {primeira['maquina_nome']} está parada"
             }), 409
 
-        tempo_agora = datetime.now()
+        tempo_agora = _agora()
 
         c.execute('''UPDATE ordens_servico
                     SET status = ?, tempo_inicio = ?
@@ -2000,13 +2091,23 @@ def _tempos_da_operacao(op, paradas, agora):
     retomada_em, inicio_real e tempo_realizado_min."""
     if op.get('tempo_realizado_min') is not None and op.get('status') == 'CONCLUIDO':
         usinagem = op['tempo_realizado_min']
+        # linha anterior à coluna dos corridos: o valor gravado era corrido
+        corrido = op.get('tempo_realizado_corrido_min')
+        if corrido is None:
+            corrido = usinagem
     elif op.get('inicio_real'):
         usinagem = op.get('tempo_acumulado_min') or 0
+        corrido = op.get('tempo_acumulado_corrido_min') or 0
         if op.get('status') == 'EXECUTANDO':
-            usinagem += _minutos_desde(op.get('retomada_em') or op['inicio_real'], agora)
+            exp, corr = _trecho(op.get('retomada_em') or op['inicio_real'], agora)
+            usinagem += exp
+            corrido += corr
     else:
-        usinagem = None
-    return {'tempo_usinagem_min': usinagem,
+        usinagem = corrido = None
+    return {'tempo_usinagem_min': usinagem,               # minutos de expediente
+            'tempo_usinagem_corrido_min': corrido,        # minutos corridos
+            'fora_do_expediente': fora_do_expediente(corrido, usinagem),
+            'fora_do_expediente_min': (corrido - usinagem) if fora_do_expediente(corrido, usinagem) else 0,
             'tempo_parado_min': sum(p['duracao_min'] for p in paradas),
             'tempo_parado_expediente_min': sum(p['expediente_min'] for p in paradas)}
 
@@ -2021,13 +2122,14 @@ def get_operacoes_os(os_id):
                         am.inicio_real, am.fim_real,
                         am.tempo_realizado_min, am.operador, am.observacao,
                         am.tempo_acumulado_min, am.retomada_em,
+                        am.tempo_realizado_corrido_min, am.tempo_acumulado_corrido_min,
                         m.nome AS maquina_nome, m.status AS maquina_status
                  FROM alocacao_maquinas am
                  JOIN maquinas m ON m.id = am.maquina_id
                  WHERE am.ordem_servico_id = ?
                  ORDER BY am.sequencia''', (os_id,))
     operacoes = []
-    agora = datetime.now()
+    agora = _agora()
     for row in c.fetchall():
         op = dict(row)
         op['paradas'] = _paradas_da_alocacao(c, op['id'], agora)
@@ -2119,7 +2221,7 @@ def get_programacao():
                  LEFT JOIN pecas p ON p.codigo = n.peca_codigo
                  ORDER BY am.maquina_id, am.inicio_planejado''')
     todas = [dict(r) for r in c.fetchall()]
-    agora_dt = datetime.now()
+    agora_dt = _agora()
     paradas_por_aloc = {}
     for r in c.execute('SELECT alocacao_id, inicio, fim FROM paradas_operacao ORDER BY inicio'):
         paradas_por_aloc.setdefault(r['alocacao_id'], []).append(dict(r))
@@ -2280,7 +2382,7 @@ def get_programacao():
         cursor += timedelta(hours=1)
 
     # Linha do "agora", só se o dia pedido for hoje
-    agora = datetime.now()
+    agora = _agora()
     agora_pct = None
     if janela_ini <= agora <= janela_fim:
         agora_pct = round(
@@ -2348,7 +2450,7 @@ def iniciar_alocacao(alocacao_id):
                 'erro': f"Máquina {aloc['maquina_nome']} está parada"
             }), 409
 
-        agora = datetime.now().isoformat()
+        agora = _agora().isoformat()
         if retomada:
             c.execute('''UPDATE alocacao_maquinas
                          SET status = 'EXECUTANDO', retomada_em = ?
@@ -2432,24 +2534,25 @@ def concluir_alocacao(alocacao_id):
         if aloc['status'] == 'LIBERADO':
             return jsonify({'erro': 'Operação ainda não foi retomada. Inicie-a de novo antes de concluir'}), 409
 
-        agora = datetime.now()
+        agora = _agora()
 
         # Tempo de usinagem = o que já estava acumulado antes de interrupções
         # + a execução atual (desde retomada_em; inicio_real nas linhas de
-        # antes da Etapa 3A). O tempo de máquina parada fica de fora.
-        realizado = None
-        try:
-            inicio = datetime.fromisoformat(aloc['retomada_em'] or aloc['inicio_real'])
-            realizado = (aloc['tempo_acumulado_min'] or 0) + int((agora - inicio).total_seconds() / 60)
-        except (ValueError, TypeError):
-            realizado = None
+        # antes da Etapa 3A). O tempo de máquina parada fica de fora. Em
+        # minutos de EXPEDIENTE (a régua do planejado); os corridos vão para
+        # tempo_realizado_corrido_min.
+        realizado = realizado_corrido = None
+        if _parse_ts(aloc['retomada_em'] or aloc['inicio_real']):
+            expediente, corrido = _trecho(aloc['retomada_em'] or aloc['inicio_real'], agora)
+            realizado = (aloc['tempo_acumulado_min'] or 0) + expediente
+            realizado_corrido = (aloc['tempo_acumulado_corrido_min'] or 0) + corrido
 
         c.execute('''UPDATE alocacao_maquinas
                      SET status = 'CONCLUIDO', fim_real = ?,
-                         tempo_realizado_min = ?, observacao = ?,
-                         operador = COALESCE(operador, ?)
+                         tempo_realizado_min = ?, tempo_realizado_corrido_min = ?,
+                         observacao = ?, operador = COALESCE(operador, ?)
                      WHERE id = ?''',
-                  (agora.isoformat(), realizado, observacao or None,
+                  (agora.isoformat(), realizado, realizado_corrido, observacao or None,
                    email, alocacao_id))
 
         # A próxima operação da mesma OS fica disponível para ser assumida.
@@ -2496,13 +2599,16 @@ def concluir_alocacao(alocacao_id):
             'sequencia': aloc['sequencia'],
             'maquina': aloc['maquina_nome'],
             'tempo_realizado_min': realizado,
+            'tempo_realizado_corrido_min': realizado_corrido,
             'os_concluida': os_concluida,
             'proxima_liberada': dict(proxima)['sequencia'] if proxima else None,
         })
 
         return jsonify({
             'status': 'ok',
-            'tempo_realizado_min': realizado,
+            'tempo_realizado_min': realizado,                    # minutos de expediente
+            'tempo_realizado_corrido_min': realizado_corrido,    # minutos corridos (auditoria)
+            'fora_do_expediente': fora_do_expediente(realizado_corrido, realizado),
             'os_concluida': os_concluida,
         }), 200
 
@@ -2590,7 +2696,7 @@ def marcar_maquina_quebrada(maquina_id):
         conn.close()
         return jsonify({'erro': 'Máquina não encontrada'}), 404
 
-    agora = datetime.now()
+    agora = _agora()
     momento_quebra = agora.isoformat()
     c.execute("UPDATE maquinas SET status = 'QUEBRADA', quebrada_em = ? WHERE id = ?",
               (momento_quebra, maquina_id))
@@ -2647,7 +2753,7 @@ def marcar_maquina_consertada(maquina_id):
         conn.close()
         return jsonify({'erro': 'Máquina não encontrada'}), 404
 
-    agora = datetime.now()
+    agora = _agora()
 
     # tempo de reparo = agora - quebrada_em. Só calcula se a quebra foi
     # registrada; máquinas que quebraram antes desta versão têm quebrada_em
@@ -3252,7 +3358,7 @@ def indicadores_manutencao():
                  GROUP BY m.id, m.nome, m.status, m.quebrada_em
                  ORDER BY m.nome''', params)
 
-    agora = datetime.now()
+    agora = _agora()
     resultado = []
     for row in c.fetchall():
         item = dict(row)

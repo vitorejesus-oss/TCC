@@ -351,3 +351,17 @@ class TestOperacaoInterrompidaNoBot:
             'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': [],
             'producao_perdida_min': {'total': 0, 'por_maquina': []}, 'operacoes_interrompidas': 0}, None)
         assert 'Produção perdida' not in texto
+
+
+class TestConclusaoForaDoExpedienteNoBot:
+    def test_avisa_quando_a_execucao_ficou_fora_do_expediente(self):
+        texto = bt.texto_conclusao({'tempo_realizado_min': 90, 'tempo_realizado_corrido_min': 930,
+                                    'fora_do_expediente': True, 'os_concluida': False},
+                                   [_op(1, 1, 'CONCLUIDO', planejado=120)], 1)
+        assert 'Execução fora do expediente' in texto and '15h30min corridos' in texto and '1h30min de expediente' in texto
+
+    def test_sem_aviso_quando_dentro_do_expediente(self):
+        texto = bt.texto_conclusao({'tempo_realizado_min': 45, 'tempo_realizado_corrido_min': 45,
+                                    'fora_do_expediente': False, 'os_concluida': False},
+                                   [_op(1, 1, 'CONCLUIDO', planejado=120)], 1)
+        assert 'fora do expediente' not in texto

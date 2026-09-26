@@ -1510,7 +1510,29 @@ class TestMinutosDeExpediente:
 
 
 class TestInterrupcaoPorQuebra:
-    """Etapa 3A: máquina que quebra interrompe a operação EXECUTANDO nela."""
+    """Etapa 3A: máquina que quebra interrompe a operação EXECUTANDO nela.
+
+    Os testes fixam o relógio do sistema (app._agora) numa segunda-feira: as
+    contas de expediente dependem de que hora é, e o resultado não pode
+    depender de quando a suíte roda."""
+
+    SEG = datetime(2031, 3, 10)   # segunda-feira, sem feriado
+
+    class _Relogio:
+        def __init__(self, agora):
+            self.agora = agora
+
+        def em(self, dia_offset, hora, minuto=0):
+            self.agora = (datetime(2031, 3, 10) + timedelta(days=dia_offset)).replace(hour=hora, minute=minuto)
+
+        def avancar(self, minutos=0, segundos=0):
+            self.agora += timedelta(minutes=minutos, seconds=segundos)
+
+    @pytest.fixture
+    def relogio(self, monkeypatch):
+        r = self._Relogio(datetime(2031, 3, 10, 9, 0))
+        monkeypatch.setattr(app_module, '_agora', lambda: r.agora)
+        return r
 
     @staticmethod
     def _nova_os(client):
@@ -1569,11 +1591,6 @@ class TestInterrupcaoPorQuebra:
         return client.post(f'/api/alocacoes/{aloc_id}/concluir', headers=_auth_papel(client, papel),
                            data=json.dumps({}), content_type='application/json')
 
-    def _recuar(self, aloc_id, minutos):
-        """Faz de conta que a execução atual começou `minutos` atrás."""
-        antes = (datetime.now() - timedelta(minutes=minutos)).isoformat()
-        self._sql('UPDATE alocacao_maquinas SET retomada_em = ? WHERE id = ?', antes, aloc_id)
-
     @pytest.fixture
     def torno(self, client):
         """Garante que o Torno Horizontal termina o teste consertado, aconteça o que acontecer."""
@@ -1590,58 +1607,62 @@ class TestInterrupcaoPorQuebra:
             paradas = {r[1] for r in conn.execute('PRAGMA table_info(paradas_operacao)')}
         finally:
             conn.close()
-        assert {'tempo_acumulado_min', 'retomada_em'} <= colunas
+        assert {'tempo_acumulado_min', 'retomada_em', 'tempo_realizado_corrido_min',
+                'tempo_acumulado_corrido_min'} <= colunas
         assert {'id', 'alocacao_id', 'maquina_id', 'inicio', 'fim', 'relatorio_manutencao_id', 'criado_em'} <= paradas
 
-    def test_iniciar_grava_retomada_em_igual_ao_inicio_real(self, client):
+    def test_iniciar_grava_retomada_em_igual_ao_inicio_real(self, client, relogio):
         _, ops = self._nova_os(client)
         assert self._iniciar(client, ops[0]['id']).status_code == 200
         linha = self._linha(ops[0]['id'])
-        assert linha['retomada_em'] == linha['inicio_real'] and not linha['tempo_acumulado_min']
+        assert linha['retomada_em'] == linha['inicio_real'] == relogio.agora.isoformat()
+        assert not linha['tempo_acumulado_min']
 
-    def test_quebra_interrompe_a_operacao_e_grava_o_acumulado(self, client, torno):
+    def test_quebra_interrompe_a_operacao_e_grava_o_acumulado(self, client, relogio, torno):
         _, ops = self._nova_os(client)
-        self._iniciar(client, ops[0]['id'])
-        inicio_real = self._linha(ops[0]['id'])['inicio_real']
-        self._recuar(ops[0]['id'], 30)
+        a = ops[0]['id']
+        self._iniciar(client, a)
+        relogio.avancar(30)
         self._quebrar(client, torno)
-        linha = self._linha(ops[0]['id'])
+        linha = self._linha(a)
         assert linha['status'] == 'INTERROMPIDA'
-        assert linha['tempo_acumulado_min'] in (29, 30, 31)      # ~30 min corridos
-        assert linha['inicio_real'] == inicio_real               # não muda
-        assert linha['retomada_em'] is None                      # nada executando agora
-        paradas = self._paradas(ops[0]['id'])
+        assert linha['tempo_acumulado_min'] == 30 and linha['tempo_acumulado_corrido_min'] == 30
+        assert linha['inicio_real'] == datetime(2031, 3, 10, 9, 0).isoformat()   # não muda
+        assert linha['retomada_em'] is None                                       # nada executando agora
+        paradas = self._paradas(a)
         assert len(paradas) == 1 and paradas[0]['fim'] is None and paradas[0]['maquina_id'] == torno
+        assert paradas[0]['inicio'] == relogio.agora.isoformat()
 
-    def test_quebra_nao_toca_operacoes_de_outras_maquinas_nem_as_nao_executando(self, client, torno):
-        _, ops = self._nova_os(client)             # OP1 Torno Horizontal (LIBERADO, não iniciada), OP2 Torno Vertical
+    def test_quebra_nao_toca_operacoes_de_outras_maquinas_nem_as_nao_executando(self, client, relogio, torno):
+        _, ops = self._nova_os(client)             # OP1 Torno Horizontal (LIBERADO), OP2 Torno Vertical
         self._quebrar(client, torno)
         assert self._linha(ops[0]['id'])['status'] == 'LIBERADO'
         assert self._linha(ops[1]['id'])['status'] == 'PLANEJADO'
         assert self._paradas(ops[0]['id']) == []
 
-    def test_segunda_quebra_soma_ao_acumulado_e_abre_outra_parada(self, client, torno):
+    def test_segunda_quebra_soma_ao_acumulado_e_abre_outra_parada(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
-        self._iniciar(client, a); self._recuar(a, 20); self._quebrar(client, torno)
-        self._consertar(client, torno)
+        self._iniciar(client, a); relogio.avancar(20); self._quebrar(client, torno)
+        relogio.avancar(60); self._consertar(client, torno)
         assert self._iniciar(client, a).status_code == 200
-        self._recuar(a, 15); self._quebrar(client, torno)
+        relogio.avancar(15); self._quebrar(client, torno)
         linha = self._linha(a)
-        assert linha['status'] == 'INTERROMPIDA' and 34 <= linha['tempo_acumulado_min'] <= 36
+        assert linha['status'] == 'INTERROMPIDA' and linha['tempo_acumulado_min'] == 35
         assert len(self._paradas(a)) == 2
 
-    def test_conserto_libera_fecha_a_parada_e_nao_reinicia_sozinho(self, client, torno):
+    def test_conserto_libera_fecha_a_parada_e_nao_reinicia_sozinho(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a); self._quebrar(client, torno)
+        relogio.avancar(45)
         self._consertar(client, torno)
         linha = self._linha(a)
         assert linha['status'] == 'LIBERADO' and linha['retomada_em'] is None
         parada = self._paradas(a)[0]
-        assert parada['fim'] is not None and parada['relatorio_manutencao_id']
+        assert parada['fim'] == relogio.agora.isoformat() and parada['relatorio_manutencao_id']
 
-    def test_nao_inicia_nem_conclui_operacao_interrompida(self, client, torno):
+    def test_nao_inicia_nem_conclui_operacao_interrompida(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a); self._quebrar(client, torno)
@@ -1650,86 +1671,148 @@ class TestInterrupcaoPorQuebra:
         r = self._concluir(client, a)
         assert r.status_code == 409 and 'interrompida' in json.loads(r.data)['erro']
 
-    def test_nao_conclui_operacao_liberada_que_ainda_nao_foi_retomada(self, client, torno):
+    def test_nao_conclui_operacao_liberada_que_ainda_nao_foi_retomada(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a); self._quebrar(client, torno); self._consertar(client, torno)
         r = self._concluir(client, a)
         assert r.status_code == 409 and 'retomada' in json.loads(r.data)['erro']
 
-    def test_retomada_preserva_inicio_real_e_grava_retomada_em(self, client, torno):
+    def test_retomada_preserva_inicio_real_e_grava_retomada_em(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
         inicio_real = self._linha(a)['inicio_real']
-        self._recuar(a, 10); self._quebrar(client, torno); self._consertar(client, torno)
+        relogio.avancar(10); self._quebrar(client, torno)
+        relogio.avancar(30); self._consertar(client, torno)
         r = self._iniciar(client, a)
         assert r.status_code == 200
         corpo = json.loads(r.data)
         assert corpo['retomada'] is True and corpo['inicio_real'] == inicio_real
         linha = self._linha(a)
         assert linha['status'] == 'EXECUTANDO' and linha['inicio_real'] == inicio_real
-        assert linha['retomada_em'] and linha['retomada_em'] != inicio_real
-        assert linha['tempo_acumulado_min'] in (9, 10, 11)
+        assert linha['retomada_em'] == relogio.agora.isoformat()
+        assert linha['tempo_acumulado_min'] == 10
 
-    def test_interrupcao_com_menos_de_um_minuto_ainda_e_retomada(self, client, torno):
+    def test_interrupcao_com_menos_de_um_minuto_ainda_e_retomada(self, client, relogio, torno):
         """acumulado = 0 não pode fazer a retomada passar por um início novo."""
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
         inicio_real = self._linha(a)['inicio_real']
+        relogio.avancar(segundos=30)
         self._quebrar(client, torno); self._consertar(client, torno)
         assert self._linha(a)['tempo_acumulado_min'] == 0
         r = self._iniciar(client, a)
         assert r.status_code == 200 and json.loads(r.data)['retomada'] is True
         assert self._linha(a)['inicio_real'] == inicio_real
 
-    def test_concluir_soma_os_dois_trechos_sem_o_tempo_parado(self, client, torno):
+    def test_concluir_soma_os_dois_trechos_sem_o_tempo_parado(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
-        self._recuar(a, 30); self._quebrar(client, torno)
-        # a máquina fica parada 3 horas (o inicio_real também recua): não pode entrar no realizado
-        agora = datetime.now()
-        self._sql('UPDATE alocacao_maquinas SET inicio_real = ? WHERE id = ?', (agora - timedelta(hours=4)).isoformat(), a)
-        self._sql('UPDATE paradas_operacao SET inicio = ? WHERE alocacao_id = ?', (agora - timedelta(hours=3)).isoformat(), a)
-        self._consertar(client, torno)
+        relogio.avancar(30); self._quebrar(client, torno)
+        relogio.avancar(180); self._consertar(client, torno)          # 3 h parada, dentro do expediente
         assert self._iniciar(client, a).status_code == 200
-        self._recuar(a, 20)
+        relogio.avancar(20)
         r = self._concluir(client, a)
         assert r.status_code == 200, r.data
-        realizado = json.loads(r.data)['tempo_realizado_min']
-        assert 49 <= realizado <= 51                    # 30 + 20; as 3 h paradas ficam de fora
-        assert self._linha(a)['tempo_realizado_min'] == realizado
+        corpo = json.loads(r.data)
+        assert corpo['tempo_realizado_min'] == 50 and corpo['tempo_realizado_corrido_min'] == 50   # 30 + 20; as 3 h ficam de fora
+        assert corpo['fora_do_expediente'] is False
+        linha = self._linha(a)
+        assert linha['tempo_realizado_min'] == 50 and linha['tempo_realizado_corrido_min'] == 50
 
-    def test_operacao_sem_interrupcao_conclui_como_antes(self, client):
+    def test_parada_que_atravessa_a_noite_fica_fora_do_realizado_e_conta_so_expediente_na_perda(self, client, relogio, torno):
+        _, ops = self._nova_os(client)
+        a = ops[0]['id']
+        relogio.em(0, 15, 30); self._iniciar(client, a)
+        relogio.em(0, 16, 0); self._quebrar(client, torno)              # 30 min de usinagem
+        relogio.em(1, 9, 0); self._consertar(client, torno)             # terça 9h
+        p = self._paradas(a)[0]
+        assert app_module.minutos_de_expediente(datetime.fromisoformat(p['inicio']), datetime.fromisoformat(p['fim'])) == 180
+        self._iniciar(client, a)
+        relogio.avancar(20)
+        corpo = json.loads(self._concluir(client, a).data)
+        assert corpo['tempo_realizado_min'] == 50 and corpo['tempo_realizado_corrido_min'] == 50
+        op = json.loads(client.get(f'/api/ordens-servico/{ops[0]["id"] and self._linha(a)["ordem_servico_id"]}/operacoes').data)[0]
+        assert op['tempo_parado_min'] == 17 * 60 and op['tempo_parado_expediente_min'] == 180
+
+    def test_realizado_em_expediente_quando_a_execucao_atravessa_a_noite(self, client, relogio):
+        """A régua do realizado é a do planejado: 16h30 -> 8h do dia seguinte = 90 min, não 15h30."""
+        _, ops = self._nova_os(client)
+        a = ops[0]['id']
+        relogio.em(0, 16, 30); self._iniciar(client, a)
+        relogio.em(1, 8, 0)
+        corpo = json.loads(self._concluir(client, a).data)
+        assert corpo['tempo_realizado_min'] == 90 and corpo['tempo_realizado_corrido_min'] == 930
+        assert corpo['fora_do_expediente'] is True
+        linha = self._linha(a)
+        assert linha['tempo_realizado_min'] == 90 and linha['tempo_realizado_corrido_min'] == 930
+
+    def test_fim_de_semana_aberto_e_sinalizado(self, client, relogio):
+        _, ops = self._nova_os(client)
+        a = ops[0]['id']
+        relogio.em(4, 16, 0); self._iniciar(client, a)                 # sexta 16h
+        relogio.em(7, 8, 0)                                              # segunda 8h
+        corpo = json.loads(self._concluir(client, a).data)
+        assert corpo['tempo_realizado_min'] == 120 and corpo['fora_do_expediente'] is True
+        assert corpo['tempo_realizado_corrido_min'] == 64 * 60
+
+    def test_limiar_da_sinalizacao_de_fora_do_expediente(self, client, relogio):
+        assert app_module.FORA_EXPEDIENTE_LIMIAR_MIN == 60
+        assert app_module.fora_do_expediente(90, 30) is True          # diferença de exatamente 60: sinaliza
+        assert app_module.fora_do_expediente(89, 30) is False         # 59: hora extra pequena, não sinaliza
+        assert app_module.fora_do_expediente(30, 30) is False
+        assert app_module.fora_do_expediente(None, 30) is False
+
+    def test_hora_extra_pequena_nao_e_sinalizada(self, client, relogio):
+        _, ops = self._nova_os(client)
+        a = ops[0]['id']
+        relogio.em(0, 16, 30); self._iniciar(client, a)
+        relogio.em(0, 17, 30)
+        corpo = json.loads(self._concluir(client, a).data)
+        assert corpo['tempo_realizado_min'] == 30 and corpo['tempo_realizado_corrido_min'] == 60
+        assert corpo['fora_do_expediente'] is False
+
+    def test_operacao_sem_interrupcao_dentro_do_expediente_conclui_como_antes(self, client, relogio):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
-        self._sql('UPDATE alocacao_maquinas SET inicio_real = ?, retomada_em = ? WHERE id = ?',
-                  (datetime.now() - timedelta(minutes=45)).isoformat(), (datetime.now() - timedelta(minutes=45)).isoformat(), a)
-        realizado = json.loads(self._concluir(client, a).data)['tempo_realizado_min']
-        assert 44 <= realizado <= 46
+        relogio.avancar(45)
+        corpo = json.loads(self._concluir(client, a).data)
+        assert corpo['tempo_realizado_min'] == corpo['tempo_realizado_corrido_min'] == 45
+        assert corpo['fora_do_expediente'] is False
 
-    def test_linha_antiga_sem_retomada_em_usa_inicio_real(self, client):
+    def test_linha_antiga_sem_retomada_em_usa_inicio_real(self, client, relogio):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
-        self._sql('UPDATE alocacao_maquinas SET retomada_em = NULL, inicio_real = ? WHERE id = ?',
-                  (datetime.now() - timedelta(minutes=25)).isoformat(), a)
-        assert 24 <= json.loads(self._concluir(client, a).data)['tempo_realizado_min'] <= 26
+        self._sql('UPDATE alocacao_maquinas SET retomada_em = NULL WHERE id = ?', a)
+        relogio.avancar(25)
+        assert json.loads(self._concluir(client, a).data)['tempo_realizado_min'] == 25
 
-    def test_endpoint_de_operacoes_traz_paradas_e_tempos(self, client, torno):
+    def test_endpoint_de_operacoes_traz_paradas_tempos_e_sinalizacao(self, client, relogio, torno):
         os_id, ops = self._nova_os(client)
         a = ops[0]['id']
-        self._iniciar(client, a); self._recuar(a, 30); self._quebrar(client, torno)
+        self._iniciar(client, a); relogio.avancar(30); self._quebrar(client, torno)
         op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
         assert op['status'] == 'INTERROMPIDA'
-        assert 29 <= op['tempo_usinagem_min'] <= 31
+        assert op['tempo_usinagem_min'] == 30 and op['tempo_usinagem_corrido_min'] == 30
+        assert op['fora_do_expediente'] is False
         assert len(op['paradas']) == 1 and op['paradas'][0]['aberta'] is True
-        assert op['tempo_parado_min'] >= 0 and 'tempo_parado_expediente_min' in op
+        assert op['tempo_parado_min'] == 0 and 'tempo_parado_expediente_min' in op
 
-    def test_detalhes_da_nota_trazem_as_paradas_da_operacao(self, client, torno):
+    def test_operacao_em_execucao_atravessando_a_noite_ja_mostra_a_sinalizacao(self, client, relogio):
+        os_id, ops = self._nova_os(client)
+        relogio.em(0, 16, 30); self._iniciar(client, ops[0]['id'])
+        relogio.em(1, 8, 0)
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['status'] == 'EXECUTANDO'
+        assert op['tempo_usinagem_min'] == 90 and op['tempo_usinagem_corrido_min'] == 930
+        assert op['fora_do_expediente'] is True and op['fora_do_expediente_min'] == 840
+
+    def test_detalhes_da_nota_trazem_as_paradas_e_a_sinalizacao(self, client, relogio, torno):
         r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
                         content_type='application/json')
         d = json.loads(r.data)
@@ -1739,31 +1822,30 @@ class TestInterrupcaoPorQuebra:
         aloc = det['alocacoes'][0]
         assert aloc['status'] == 'INTERROMPIDA' and len(aloc['paradas']) == 1
         assert {'inicio', 'fim', 'duracao_min', 'expediente_min'} <= set(aloc['paradas'][0])
-        assert 'tempo_usinagem_min' in aloc and 'tempo_parado_min' in aloc
+        assert {'tempo_usinagem_min', 'tempo_parado_min', 'fora_do_expediente', 'tempo_usinagem_corrido_min'} <= set(aloc)
 
-    def test_programacao_mostra_a_operacao_interrompida_e_o_trecho_parado(self, client, torno):
+    def test_programacao_mostra_a_operacao_interrompida_e_o_trecho_parado(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a)
-        self._sql('UPDATE alocacao_maquinas SET inicio_real = ?, retomada_em = ? WHERE id = ?',
-                  (datetime.now() - timedelta(minutes=40)).isoformat(), (datetime.now() - timedelta(minutes=40)).isoformat(), a)
+        relogio.avancar(40)
         self._quebrar(client, torno)
-        dia = datetime.now().strftime('%Y-%m-%d')
-        prog = json.loads(client.get(f'/api/programacao?data={dia}').data)
+        relogio.avancar(20)          # a parada precisa ter alguma duração para aparecer na barra
+        prog = json.loads(client.get('/api/programacao?data=2031-03-10').data)
         barra = next(b for m in prog['maquinas'] for b in m['barras'] if b['alocacao_id'] == a)
         assert barra['status'] == 'INTERROMPIDA'
         assert barra['realizado'] is not None
         assert len(barra['paradas']) == 1 and barra['paradas'][0]['aberta'] is True
         assert barra['paradas'][0]['largura_pct'] > 0
 
-    def test_quebra_gera_auditoria_da_operacao_interrompida(self, client, torno):
+    def test_quebra_gera_auditoria_da_operacao_interrompida(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         self._iniciar(client, ops[0]['id']); self._quebrar(client, torno)
         eventos = json.loads(client.get('/api/auditoria').data)
         e = next(x for x in eventos if x['tipo_evento'] == 'OPERACAO_INTERROMPIDA')
         assert e['usuario'] == 'operador@fabrica.com'
 
-    def test_conserto_e_retomada_geram_auditoria(self, client, torno):
+    def test_conserto_e_retomada_geram_auditoria(self, client, relogio, torno):
         _, ops = self._nova_os(client)
         a = ops[0]['id']
         self._iniciar(client, a); self._quebrar(client, torno); self._consertar(client, torno)
@@ -1772,10 +1854,128 @@ class TestInterrupcaoPorQuebra:
         assert {'OPERACAO_LIBERADA', 'OPERACAO_RETOMADA'} <= tipos
 
 
+class TestMigracaoDoRealizadoParaExpediente:
+    """Operações antigas: tempo_realizado_min passa de minutos corridos para minutos de expediente."""
+
+    SEG = datetime(2031, 3, 10)
+
+    @staticmethod
+    def _inserir(ini, fim, realizado, corrido=None, status='CONCLUIDO'):
+        conn = app_module.get_db()
+        try:
+            maquina_id = conn.execute("SELECT id FROM maquinas WHERE nome = 'Torno Vertical'").fetchone()[0]
+            os_id = conn.execute('SELECT id FROM ordens_servico ORDER BY id DESC LIMIT 1').fetchone()[0]
+            cur = conn.execute('''INSERT INTO alocacao_maquinas
+                                  (ordem_servico_id, maquina_id, sequencia, status, inicio_real, fim_real,
+                                   tempo_realizado_min, tempo_realizado_corrido_min)
+                                  VALUES (?, ?, 98, ?, ?, ?, ?, ?)''',
+                               (os_id, maquina_id, status, ini.isoformat(), fim.isoformat() if fim else None,
+                                realizado, corrido))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ler(alocacao_id):
+        conn = app_module.get_db()
+        try:
+            r = conn.execute('SELECT tempo_realizado_min r, tempo_realizado_corrido_min c FROM alocacao_maquinas WHERE id = ?',
+                             (alocacao_id,)).fetchone()
+            return r['r'], r['c']
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _limpar(*ids):
+        conn = app_module.get_db()
+        try:
+            for i in ids:
+                conn.execute('DELETE FROM alocacao_maquinas WHERE id = ?', (i,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _migrar(monkeypatch):
+        chamadas = []
+        monkeypatch.setattr(app_module, 'criar_backup', lambda: chamadas.append(1) or 'backup.db')
+        conn = app_module.get_db()
+        try:
+            return app_module._migrar_realizado_para_expediente(conn), chamadas
+        finally:
+            conn.close()
+
+    def test_operacao_do_fim_de_semana_e_recalculada_e_o_corrido_e_guardado(self, client, monkeypatch):
+        ini = self.SEG + timedelta(days=4, hours=16)                  # sexta 16h
+        fim = self.SEG + timedelta(days=7, hours=8)                   # segunda 8h
+        corrido = int((fim - ini).total_seconds() / 60)
+        a = self._inserir(ini, fim, realizado=corrido)
+        try:
+            recalculadas, chamadas = self._migrar(monkeypatch)
+            assert recalculadas >= 1 and chamadas
+            assert self._ler(a) == (120, corrido)                      # 60 (sexta) + 60 (segunda)
+        finally:
+            self._limpar(a)
+
+    def test_operacao_dentro_do_expediente_mantem_o_valor_e_ganha_o_corrido(self, client, monkeypatch):
+        a = self._inserir(self.SEG.replace(hour=9), self.SEG.replace(hour=11), realizado=118)   # 118 gravado, 120 nos timestamps
+        try:
+            self._migrar(monkeypatch)
+            assert self._ler(a) == (118, 118)                          # nada muda além da coluna de auditoria
+        finally:
+            self._limpar(a)
+
+    def test_e_idempotente(self, client, monkeypatch):
+        ini, fim = self.SEG.replace(hour=16), (self.SEG + timedelta(days=1)).replace(hour=8)
+        a = self._inserir(ini, fim, realizado=960)
+        try:
+            self._migrar(monkeypatch)
+            primeira = self._ler(a)
+            assert primeira == (120, 960)
+            recalculadas, chamadas = self._migrar(monkeypatch)
+            assert self._ler(a) == primeira and recalculadas == 0 and not chamadas
+        finally:
+            self._limpar(a)
+
+    def test_linha_ja_migrada_nao_e_tocada(self, client, monkeypatch):
+        ini, fim = self.SEG.replace(hour=16), (self.SEG + timedelta(days=1)).replace(hour=8)
+        a = self._inserir(ini, fim, realizado=77, corrido=960)
+        try:
+            self._migrar(monkeypatch)
+            assert self._ler(a) == (77, 960)
+        finally:
+            self._limpar(a)
+
+    def test_sem_recalculo_nao_faz_backup(self, client, monkeypatch):
+        a = self._inserir(self.SEG.replace(hour=9), self.SEG.replace(hour=10), realizado=60)
+        try:
+            recalculadas, chamadas = self._migrar(monkeypatch)
+            assert recalculadas == 0 and not chamadas
+        finally:
+            self._limpar(a)
+
+    def test_falha_no_backup_adia_o_recalculo(self, client, monkeypatch):
+        ini, fim = self.SEG.replace(hour=16), (self.SEG + timedelta(days=1)).replace(hour=8)
+        a = self._inserir(ini, fim, realizado=960)
+        try:
+            def quebrado():
+                raise OSError('disco cheio')
+            monkeypatch.setattr(app_module, 'criar_backup', quebrado)
+            conn = app_module.get_db()
+            try:
+                assert app_module._migrar_realizado_para_expediente(conn) == 0
+            finally:
+                conn.close()
+            assert self._ler(a) == (960, None)                         # nada foi mexido sem backup
+        finally:
+            self._limpar(a)
+
+
 class TestProducaoPerdida:
     """/api/indicadores/manutencao: producao_perdida_min (minutos de expediente) e operações interrompidas."""
 
-    SEG = datetime(2031, 3, 10)
+    SEG = datetime(2033, 3, 14)
 
     @staticmethod
     def _preparar():
@@ -1824,7 +2024,7 @@ class TestProducaoPerdida:
             # sáb 10h -> dom 10h: 0 min (fim de semana)
             sab = self.SEG + timedelta(days=5)
             self._parada(aloc, maq, sab.replace(hour=10), sab.replace(hour=10) + timedelta(days=1))
-            d = self._indicadores(client, de='2031-03-01', ate='2031-03-31')
+            d = self._indicadores(client, de='2033-03-01', ate='2033-03-31')
             assert d['producao_perdida_min']['total'] == 120
             por = {m['nome']: m['minutos'] for m in d['producao_perdida_min']['por_maquina']}
             assert por['Torno Vertical'] == 120 and sum(por.values()) == 120
@@ -1838,10 +2038,10 @@ class TestProducaoPerdida:
         aloc, maq = self._preparar()
         try:
             self._parada(aloc, maq, self.SEG.replace(hour=9), self.SEG.replace(hour=10))
-            assert self._indicadores(client, de='2031-03-10', ate='2031-03-10')['producao_perdida_min']['total'] == 60
-            assert self._indicadores(client, de='2031-03-11', ate='2031-03-31')['producao_perdida_min']['total'] == 0
-            assert self._indicadores(client, de='2031-04-01', ate='2031-04-30')['producao_perdida_min']['total'] == 0
-            assert self._indicadores(client, de='2031-03-01', ate='2031-03-09')['operacoes_interrompidas'] == 0
+            assert self._indicadores(client, de='2033-03-14', ate='2033-03-14')['producao_perdida_min']['total'] == 60
+            assert self._indicadores(client, de='2033-03-15', ate='2033-03-31')['producao_perdida_min']['total'] == 0
+            assert self._indicadores(client, de='2033-04-01', ate='2033-04-30')['producao_perdida_min']['total'] == 0
+            assert self._indicadores(client, de='2033-03-01', ate='2033-03-13')['operacoes_interrompidas'] == 0
         finally:
             self._limpar(aloc)
 
@@ -1850,7 +2050,7 @@ class TestProducaoPerdida:
         try:
             self._parada(aloc, maq, self.SEG.replace(hour=8), self.SEG.replace(hour=9))
             self._parada(aloc, maq, self.SEG.replace(hour=13), self.SEG.replace(hour=15))
-            d = self._indicadores(client, de='2031-03-10', ate='2031-03-10')
+            d = self._indicadores(client, de='2033-03-14', ate='2033-03-14')
             assert d['producao_perdida_min']['total'] == 180 and d['operacoes_interrompidas'] == 1
         finally:
             self._limpar(aloc)

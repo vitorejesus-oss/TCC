@@ -335,6 +335,9 @@ def texto_conclusao(resultado, operacoes, alocacao_id):
         else:
             linhas.append('   (exatamente o planejado)')
 
+    if resultado.get('fora_do_expediente'):
+        linhas.append(f"⚠️ Execução fora do expediente: {texto_duracao(resultado.get('tempo_realizado_corrido_min'))} "
+                      f"corridos para {texto_duracao(realizado)} de expediente.")
     if resultado.get('os_concluida'):
         linhas.append('🏁 Era a última operação: a OS está concluída.')
     else:

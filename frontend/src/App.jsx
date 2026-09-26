@@ -100,6 +100,122 @@ const FILTROS_VAZIOS = {
   concluida_de: '', concluida_ate: '', operador: '', em_atraso: false,
 };
 
+// Produção perdida por máquina parada (Etapa 3A): o indicador que liga
+// manutenção e produção. Módulo-level (estado próprio: período e dados) e
+// renderizado ao lado do PainelGestao, não dentro dele, pelo mesmo motivo do
+// ModalVerMais. O endpoint só atende coordenador, gestor e diretor.
+function ProducaoPerdida({ token, role }) {
+  const permitido = ['coordenador', 'gestor', 'diretor'].includes(role);
+  const [dados, setDados] = useState(null);
+  const [de, setDe] = useState('');
+  const [ate, setAte] = useState('');
+  const [erro, setErro] = useState('');
+
+  async function carregar(periodo = { de, ate }) {
+    const params = new URLSearchParams();
+    if (periodo.de) params.set('de', periodo.de);
+    if (periodo.ate) params.set('ate', periodo.ate);
+    try {
+      const res = await fetch(`${API_URL}/indicadores/manutencao?${params}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.erro || 'Erro ao carregar o indicador');
+      setDados(json);
+      setErro('');
+    } catch (e) {
+      setErro(e.message);
+    }
+  }
+
+  useEffect(() => {
+    if (!permitido || !token) return undefined;
+    carregar();
+    const timer = setInterval(() => carregar(), 15000);   // parada aberta continua contando
+    return () => clearInterval(timer);
+  }, [token, permitido, de, ate]);
+
+  if (!permitido) return null;
+
+  const perdida = dados?.producao_perdida_min;
+  const porMaquina = dados
+    ? [...dados.maquinas].sort((a, b) => b.producao_perdida_min - a.producao_perdida_min || a.nome.localeCompare(b.nome))
+    : [];
+
+  return (
+    <div className="painel" style={{ marginTop: 20 }} data-testid="producao-perdida">
+      <h2 style={{ marginBottom: 6 }}>Produção perdida por máquina parada</h2>
+      <p className="texto-suave" style={{ marginBottom: 14 }}>
+        Minutos de <strong>expediente</strong> em que operações ficaram interrompidas porque a máquina quebrou.
+        Parada à noite, no fim de semana ou em feriado não conta; parada ainda aberta conta até agora.
+      </p>
+
+      <div className="filtros-os" style={{ marginBottom: 16 }}>
+        <label>De <input type="date" value={de} onChange={(e) => setDe(e.target.value)} /></label>
+        <label>Até <input type="date" value={ate} onChange={(e) => setAte(e.target.value)} /></label>
+        <div className="filtro-acoes">
+          <button type="button" className="btn-pequeno" onClick={() => { setDe(''); setAte(''); }}>Todo o período</button>
+        </div>
+      </div>
+
+      {erro && <p style={{ color: 'var(--vermelho)' }}>{erro}</p>}
+      {!dados && !erro && <p>Carregando...</p>}
+
+      {dados && (
+        <>
+          <div className="cards-grid">
+            <div className="card-metrica">
+              <div className="metrica-icon">⏸️</div>
+              <div className="metrica-label">Produção perdida</div>
+              <div className="metrica-valor" data-testid="perdida-total">{formatarMin(perdida.total)}</div>
+            </div>
+            <div className="card-metrica">
+              <div className="metrica-icon">🔧</div>
+              <div className="metrica-label">Operações interrompidas</div>
+              <div className="metrica-valor" data-testid="interrompidas-total">{dados.operacoes_interrompidas}</div>
+            </div>
+            <div className="card-metrica">
+              <div className="metrica-icon">🏭</div>
+              <div className="metrica-label">Máquinas paradas agora</div>
+              <div className="metrica-valor">{dados.paradas} de {dados.total}</div>
+            </div>
+            <div className="card-metrica">
+              <div className="metrica-icon">📈</div>
+              <div className="metrica-label">Disponibilidade</div>
+              <div className="metrica-valor">{dados.disponibilidade_percentual ?? '—'}%</div>
+            </div>
+          </div>
+
+          <div className="tabela-wrapper" style={{ marginTop: 20 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Máquina</th>
+                  <th>Situação</th>
+                  <th>Produção perdida</th>
+                  <th>Operações interrompidas</th>
+                </tr>
+              </thead>
+              <tbody>
+                {porMaquina.map((m) => (
+                  <tr key={m.id}>
+                    <td><strong>{m.nome}</strong></td>
+                    <td>{m.status === 'QUEBRADA'
+                      ? <span style={{ color: 'var(--vermelho)', fontWeight: 600 }}>Parada{m.parada_ha_min != null ? ` há ${formatarMin(m.parada_ha_min)}` : ''}</span>
+                      : <span className="texto-suave">Disponível</span>}</td>
+                    <td className="mono">{m.producao_perdida_min ? formatarMin(m.producao_perdida_min) : <span className="texto-suave">—</span>}</td>
+                    <td className="mono">{m.operacoes_interrompidas || <span className="texto-suave">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // Catálogo de peças: o que já tem desenho e ficha técnica e o que falta, para a
 // equipe saber o que cadastrar. Module-level (estado próprio, sobrevive ao poll).
 function CatalogoPecas() {
@@ -524,11 +640,18 @@ function ModalVerMais({ notaId, token, onClose }) {
                       {a.sequencia}. {a.maquina_nome} — {a.status}
                       {a.inicio_real && (
                         <div className="texto-suave">
-                          ⏱️ Usinagem: <strong>{formatarMin(a.tempo_usinagem_min)}</strong>
+                          ⏱️ Usinagem: <strong>{formatarMin(a.tempo_usinagem_min)}</strong> de expediente
                           {a.paradas && a.paradas.length > 0 && (
                             <> · Parado: <strong>{formatarMin(a.tempo_parado_min)}</strong>
                               {' '}({formatarMin(a.tempo_parado_expediente_min)} de expediente)</>
                           )}
+                        </div>
+                      )}
+                      {a.fora_do_expediente && (
+                        <div className="aviso-provisorio" data-testid="fora-do-expediente">
+                          ⚠️ Execução fora do expediente: {formatarMin(a.tempo_usinagem_corrido_min)} corridos para{' '}
+                          {formatarMin(a.tempo_usinagem_min)} de expediente ({formatarMin(a.fora_do_expediente_min)} fora
+                          do horário: hora extra ou operação deixada em aberto).
                         </div>
                       )}
                       {(a.paradas || []).map((p, j) => (
@@ -1981,6 +2104,7 @@ export default function SistemaAutomacao() {
 
       {tab === 'operador' && <PainelOperador />}
       {tab === 'gestao' && <PainelGestao />}
+      {tab === 'gestao' && <ProducaoPerdida token={token} role={role} />}
       {tab === 'notas' && <PainelNotas />}
       {tab === 'auditoria' && <PainelAuditoria />}
       {tab === 'sap' && <PainelSap />}
