@@ -2071,12 +2071,37 @@ def iniciar_ordem(os_id):
     finally:
         conn.close()
 
+def muito_acima_do_planejado(usinagem_min, planejado_min):
+    """Tempo de usinagem acima de OPERACAO_ESQUECIDA_FATOR x o planejado (ambos
+    em minutos de expediente). O critério é a confiabilidade do dado, não o
+    horário: 16 h de expediente numa operação de 2 h é tão suspeito quanto uma
+    que atravessou a noite."""
+    return (bool(planejado_min) and usinagem_min is not None
+            and usinagem_min > OPERACAO_ESQUECIDA_FATOR * planejado_min)
+
+
 def possivelmente_esquecida(status, usinagem_min, planejado_min):
     """Operação EXECUTANDO cujo tempo de usinagem já passou de
-    OPERACAO_ESQUECIDA_FATOR x o planejado (ambos em minutos de expediente):
-    quase sempre é operação deixada em aberto, não produção."""
-    return (status == 'EXECUTANDO' and bool(planejado_min) and usinagem_min is not None
-            and usinagem_min > OPERACAO_ESQUECIDA_FATOR * planejado_min)
+    OPERACAO_ESQUECIDA_FATOR x o planejado: quase sempre é operação deixada
+    em aberto, não produção."""
+    return status == 'EXECUTANDO' and muito_acima_do_planejado(usinagem_min, planejado_min)
+
+
+# Motivos pelos quais uma operação CONCLUÍDA fica fora do tempo médio e do desvio.
+MOTIVO_FORA_DO_EXPEDIENTE = 'fora_do_expediente'
+MOTIVO_MUITO_ACIMA = 'muito_acima_do_planejado'
+
+
+def motivos_de_exclusao(status, usinagem_min, corrido_min, planejado_min):
+    """Lista de motivos (vazia = a operação entra no cálculo). Só vale para operação concluída."""
+    if status != 'CONCLUIDO':
+        return []
+    motivos = []
+    if fora_do_expediente(corrido_min, usinagem_min):
+        motivos.append(MOTIVO_FORA_DO_EXPEDIENTE)
+    if muito_acima_do_planejado(usinagem_min, planejado_min):
+        motivos.append(MOTIVO_MUITO_ACIMA)
+    return motivos
 
 
 def _planejado_da_operacao(op):
@@ -2131,13 +2156,16 @@ def _tempos_da_operacao(op, paradas, agora, planejado=None):
     if planejado is None:
         planejado = _planejado_da_operacao(op)
     fora = fora_do_expediente(corrido, usinagem)
+    motivos = motivos_de_exclusao(op.get('status'), usinagem, corrido, planejado)
     return {'tempo_usinagem_min': usinagem,               # minutos de expediente
             'tempo_usinagem_corrido_min': corrido,        # minutos corridos
             # EXECUTANDO passou muito do planejado: possivelmente esquecida em aberto
             'possivelmente_esquecida': possivelmente_esquecida(op.get('status'), usinagem, planejado),
             'limite_esquecida_min': int(OPERACAO_ESQUECIDA_FATOR * planejado) if planejado else None,
-            # concluída fora do expediente: fica fora do tempo médio e do desvio
-            'excluida_dos_indicadores': op.get('status') == 'CONCLUIDO' and fora,
+            # concluída fora do expediente ou com tempo muito acima do planejado:
+            # fica fora do tempo médio e do desvio
+            'excluida_dos_indicadores': bool(motivos),
+            'motivos_de_exclusao': motivos,
             'fora_do_expediente': fora,
             'fora_do_expediente_min': (corrido - usinagem) if fora_do_expediente(corrido, usinagem) else 0,
             'tempo_parado_min': sum(p['duracao_min'] for p in paradas),
@@ -3294,11 +3322,17 @@ def get_estatisticas():
     # Operação concluída FORA DO EXPEDIENTE (minutos corridos excedem os de
     # expediente em >= FORA_EXPEDIENTE_LIMIAR_MIN) fica de fora do tempo médio e
     # do desvio: quase sempre é operação deixada em aberto, não produção.
-    excluida = (f'(am.tempo_realizado_corrido_min IS NOT NULL AND am.tempo_realizado_min IS NOT NULL '
-                f'AND am.tempo_realizado_corrido_min - am.tempo_realizado_min >= {int(FORA_EXPEDIENTE_LIMIAR_MIN)})')
     planejado_sql = '''COALESCE(am.tempo_planejado_min,
                                   (julianday(am.fim_planejado)
                                    - julianday(am.inicio_planejado)) * 24 * 60)'''
+    # Dois motivos, ambos sobre operação concluída (realizado gravado):
+    #  - fora do expediente: corridos excedem os de expediente em >= o limiar;
+    #  - muito acima do planejado: realizado (expediente) > FATOR x planejado.
+    motivo_expediente = (f'(am.tempo_realizado_corrido_min IS NOT NULL AND am.tempo_realizado_min IS NOT NULL '
+                         f'AND am.tempo_realizado_corrido_min - am.tempo_realizado_min >= {int(FORA_EXPEDIENTE_LIMIAR_MIN)})')
+    motivo_acima = (f'(am.tempo_realizado_min IS NOT NULL AND {planejado_sql} > 0 '
+                    f'AND am.tempo_realizado_min > {float(OPERACAO_ESQUECIDA_FATOR)} * {planejado_sql})')
+    excluida = f'({motivo_expediente} OR {motivo_acima})'
     c.execute(f'''SELECT m.nome AS maquina,
                         COUNT(am.id) AS operacoes,
                         SUM(CASE WHEN am.fim_real IS NOT NULL THEN 1 ELSE 0 END)
@@ -3324,14 +3358,23 @@ def get_estatisticas():
     c.execute(f'''SELECT os.numero AS os_numero, am.sequencia, m.nome AS maquina,
                         am.tempo_realizado_min AS expediente_min,
                         am.tempo_realizado_corrido_min AS corrido_min,
-                        {planejado_sql} AS planejado_min
+                        {planejado_sql} AS planejado_min,
+                        CASE WHEN {motivo_expediente} THEN 1 ELSE 0 END AS por_expediente,
+                        CASE WHEN {motivo_acima} THEN 1 ELSE 0 END AS por_acima
                  FROM alocacao_maquinas am
                  JOIN maquinas m ON m.id = am.maquina_id
                  JOIN ordens_servico os ON os.id = am.ordem_servico_id
                  JOIN notas n ON n.id = os.nota_id
                  WHERE {filtro} AND {excluida}
                  ORDER BY os.numero, am.sequencia''', params)
-    fora_do_calculo = [dict(row) for row in c.fetchall()]
+    fora_do_calculo = []
+    for row in c.fetchall():
+        o = dict(row)
+        o['motivos'] = ([MOTIVO_FORA_DO_EXPEDIENTE] if o.pop('por_expediente') else []) + \
+                       ([MOTIVO_MUITO_ACIMA] if o.pop('por_acima') else [])
+        fora_do_calculo.append(o)
+    por_motivo = {m: sum(1 for o in fora_do_calculo if m in o['motivos'])
+                  for m in (MOTIVO_FORA_DO_EXPEDIENTE, MOTIVO_MUITO_ACIMA)}
 
     c.execute(f'''SELECT COALESCE(n.solicitante, 'NAO_INFORMADO') as operador,
                         COUNT(*) as total_notas,
@@ -3362,10 +3405,18 @@ def get_estatisticas():
     return jsonify({
         'desempenho_por_maquina': desempenho_maquinas,
         'operacoes_fora_do_calculo': {
-            'total': len(fora_do_calculo),
+            'total': len(fora_do_calculo),                       # operações distintas (uma pode ter os dois motivos)
+            'por_motivo': por_motivo,
             'limiar_min': FORA_EXPEDIENTE_LIMIAR_MIN,
-            'motivo': (f'execução fora do expediente: os minutos corridos passaram os de expediente em pelo menos '
-                       f'{FORA_EXPEDIENTE_LIMIAR_MIN} min (hora extra, fim de semana ou operação deixada em aberto)'),
+            'fator_planejado': OPERACAO_ESQUECIDA_FATOR,
+            'motivos': {
+                MOTIVO_FORA_DO_EXPEDIENTE: (
+                    f'execução fora do expediente: os minutos corridos passaram os de expediente em pelo menos '
+                    f'{FORA_EXPEDIENTE_LIMIAR_MIN} min (hora extra, fim de semana ou operação deixada em aberto)'),
+                MOTIVO_MUITO_ACIMA: (
+                    f'tempo muito acima do planejado: o realizado passou de {OPERACAO_ESQUECIDA_FATOR:g}x o planejado '
+                    f'(dado pouco confiável, mesmo dentro do expediente)'),
+            },
             'operacoes': fora_do_calculo,
         },
         'notas_por_operador': por_operador,

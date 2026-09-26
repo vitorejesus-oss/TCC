@@ -370,8 +370,14 @@ def texto_indicadores(indicadores, estatisticas):
                 linhas.append(f"  {m['nome']}: {texto_duracao(m['minutos'])}")
     fora = (estatisticas or {}).get('operacoes_fora_do_calculo') or {}
     if fora.get('total'):
-        linhas.append(f"⚠️ {fora['total']} operação(ões) ficaram fora do tempo médio e do desvio "
-                      f"(execução fora do expediente: hora extra ou operação deixada em aberto).")
+        por = fora.get('por_motivo') or {}
+        partes = []
+        if por.get('fora_do_expediente'):
+            partes.append(f"{por['fora_do_expediente']} por execução fora do expediente")
+        if por.get('muito_acima_do_planejado'):
+            partes.append(f"{por['muito_acima_do_planejado']} por tempo muito acima do planejado")
+        linhas.append(f"⚠️ {fora['total']} operação(ões) ficaram fora do tempo médio e do desvio"
+                      + (f" ({'; '.join(partes)})." if partes else '.'))
     od = estatisticas.get('origem_dados') if estatisticas else None
     if od and od.get('demonstracao'):
         linhas.append(f"\n⚠️ Inclui {od['demonstracao']} registro(s) de demonstração, "

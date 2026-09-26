@@ -659,7 +659,14 @@ function ModalVerMais({ notaId, token, onClose }) {
                           ⚠️ Execução fora do expediente: {formatarMin(a.tempo_usinagem_corrido_min)} corridos para{' '}
                           {formatarMin(a.tempo_usinagem_min)} de expediente ({formatarMin(a.fora_do_expediente_min)} fora
                           do horário: hora extra ou operação deixada em aberto).
-                          {a.excluida_dos_indicadores && ' Esta operação fica fora do tempo médio e do desvio.'}
+                        </div>
+                      )}
+                      {a.excluida_dos_indicadores && (
+                        <div className="aviso-provisorio" data-testid="excluida-dos-indicadores">
+                          ⚠️ Esta operação fica fora do tempo médio e do desvio:{' '}
+                          {(a.motivos_de_exclusao || []).map((m) => (m === 'fora_do_expediente'
+                            ? 'execução fora do expediente'
+                            : `tempo muito acima do planejado (${formatarMin(a.tempo_usinagem_min)} para ${formatarMin(a.tempo_planejado_min)} planejados)`)).join(' e ')}.
                         </div>
                       )}
                       {(a.paradas || []).map((p, j) => (
@@ -1949,13 +1956,22 @@ export default function SistemaAutomacao() {
           <div className="aviso-provisorio" style={{ marginTop: 0, marginBottom: 12 }} data-testid="fora-do-calculo">
             ⚠️ {estatisticas.operacoes_fora_do_calculo.total === 1
               ? '1 operação ficou fora'
-              : `${estatisticas.operacoes_fora_do_calculo.total} operações ficaram fora`} do cálculo do tempo médio e do desvio:{' '}
-            {estatisticas.operacoes_fora_do_calculo.motivo}.
-            <ul style={{ margin: '6px 0 0 18px' }}>
+              : `${estatisticas.operacoes_fora_do_calculo.total} operações ficaram fora`} do cálculo do tempo médio e do desvio, por dado pouco confiável:
+            <ul style={{ margin: '6px 0 6px 18px' }}>
+              {['fora_do_expediente', 'muito_acima_do_planejado']
+                .filter((m) => estatisticas.operacoes_fora_do_calculo.por_motivo[m] > 0)
+                .map((m) => (
+                  <li key={m} data-testid={`motivo-${m}`}>
+                    <strong>{estatisticas.operacoes_fora_do_calculo.por_motivo[m]}</strong> por {estatisticas.operacoes_fora_do_calculo.motivos[m]}
+                  </li>
+                ))}
+            </ul>
+            <ul style={{ margin: '0 0 0 18px' }}>
               {estatisticas.operacoes_fora_do_calculo.operacoes.map((o, i) => (
                 <li key={i}>
                   {o.os_numero} · OP {o.sequencia} · {o.maquina}: {formatarMin(o.corrido_min)} corridos,{' '}
                   {formatarMin(o.expediente_min)} de expediente, {formatarMin(o.planejado_min)} planejados
+                  {' '}({o.motivos.map((m) => (m === 'fora_do_expediente' ? 'fora do expediente' : 'tempo muito acima do planejado')).join(' e ')})
                 </li>
               ))}
             </ul>

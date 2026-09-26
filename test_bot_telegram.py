@@ -395,3 +395,18 @@ class TestEsquecidaNoBot:
             {'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': []},
             {'operacoes_fora_do_calculo': {'total': 0}})
         assert 'fora do tempo médio' not in texto
+
+
+class TestIndicadoresDistinguemOsMotivosNoBot:
+    BASE = {'disponibilidade_percentual': 100, 'paradas': 0, 'total': 8, 'maquinas': []}
+
+    def test_mostra_a_quebra_por_motivo(self):
+        texto = bt.texto_indicadores(self.BASE, {'operacoes_fora_do_calculo': {
+            'total': 3, 'por_motivo': {'fora_do_expediente': 2, 'muito_acima_do_planejado': 2}}})
+        assert '3 operação(ões) ficaram fora do tempo médio e do desvio' in texto
+        assert '2 por execução fora do expediente' in texto and '2 por tempo muito acima do planejado' in texto
+
+    def test_so_o_motivo_que_existe(self):
+        texto = bt.texto_indicadores(self.BASE, {'operacoes_fora_do_calculo': {
+            'total': 1, 'por_motivo': {'fora_do_expediente': 0, 'muito_acima_do_planejado': 1}}})
+        assert 'por tempo muito acima do planejado' in texto and 'por execução fora do expediente' not in texto

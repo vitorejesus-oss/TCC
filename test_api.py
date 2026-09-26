@@ -2231,7 +2231,13 @@ class TestIndicadoresSemForaDoExpediente:
                                      WHERE m.nome = 'Torno Vertical' ''').fetchall()
         finally:
             conn.close()
-        incluidas = [x for x in linhas if x['r'] is not None and not (x['c'] is not None and x['c'] - x['r'] >= limiar)]
+        fator = app_module.OPERACAO_ESQUECIDA_FATOR
+
+        def excluida(x):
+            fora = x['c'] is not None and x['c'] - x['r'] >= limiar
+            acima = bool(x['p']) and x['r'] > fator * x['p']
+            return fora or acima
+        incluidas = [x for x in linhas if x['r'] is not None and not excluida(x)]
         media = round(sum(x['r'] for x in incluidas) / len(incluidas), 1) if incluidas else None
         desvios = [x['r'] - x['p'] for x in incluidas if x['p'] is not None]
         desvio = round(sum(desvios) / len(desvios), 1) if desvios else None
@@ -2272,7 +2278,8 @@ class TestIndicadoresSemForaDoExpediente:
         try:
             fora = self._stats(client)['operacoes_fora_do_calculo']
             assert fora['limiar_min'] == app_module.FORA_EXPEDIENTE_LIMIAR_MIN
-            assert 'fora do expediente' in fora['motivo']
+            assert 'fora do expediente' in fora['motivos']['fora_do_expediente']
+            assert 'muito acima do planejado' in fora['motivos']['muito_acima_do_planejado']
             item = next(o for o in fora['operacoes'] if o['corrido_min'] == 3847)
             assert item['expediente_min'] == 120 and item['planejado_min'] == 100 and item['maquina'] == 'Torno Vertical'
             assert {'os_numero', 'sequencia'} <= set(item)
@@ -2321,3 +2328,101 @@ class TestIndicadoresSemForaDoExpediente:
         op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
         assert op['fora_do_expediente'] is True and op['excluida_dos_indicadores'] is True
         assert op['possivelmente_esquecida'] is False
+
+
+class TestExclusaoPorTempoMuitoAcimaDoPlanejado:
+    """O critério é a confiabilidade do dado, não o horário: 16 h de expediente numa operação
+    de 2 h é tão suspeito quanto uma que atravessou a noite."""
+
+    SEG = datetime(2031, 3, 10)
+    _inserir = staticmethod(TestIndicadoresSemForaDoExpediente._inserir)
+    _limpar = staticmethod(TestIndicadoresSemForaDoExpediente._limpar)
+    _stats = staticmethod(TestIndicadoresSemForaDoExpediente._stats)
+
+    def test_regra_pura_de_motivos(self):
+        m = app_module.motivos_de_exclusao
+        assert m('CONCLUIDO', 120, 120, 120) == []
+        assert m('CONCLUIDO', 240, 240, 120) == []                                   # exatamente 2x: entra
+        assert m('CONCLUIDO', 241, 241, 120) == ['muito_acima_do_planejado']         # dentro do expediente
+        assert m('CONCLUIDO', 90, 930, 120) == ['fora_do_expediente']                # atravessou a noite, tempo normal
+        assert m('CONCLUIDO', 1711, 4231, 150) == ['fora_do_expediente', 'muito_acima_do_planejado']   # o caso da OP 278
+        assert m('EXECUTANDO', 1711, 4231, 150) == []                                # só concluída é excluída
+        assert m('CONCLUIDO', 5000, 5000, None) == [] and m('CONCLUIDO', 5000, 5000, 0) == []
+        assert m('CONCLUIDO', None, None, 120) == []
+
+    def test_16h_de_expediente_numa_operacao_de_2h_sai_do_calculo_sem_atravessar_a_noite(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']
+        aloc = self._inserir(self.SEG.replace(hour=7), self.SEG + timedelta(days=1, hours=17), realizado=960, corrido=960,
+                             planejado=120)
+        try:
+            d = self._stats(client)
+            fora = d['operacoes_fora_do_calculo']
+            assert fora['total'] == antes['total'] + 1
+            assert fora['por_motivo']['muito_acima_do_planejado'] == antes['por_motivo']['muito_acima_do_planejado'] + 1
+            assert fora['por_motivo']['fora_do_expediente'] == antes['por_motivo']['fora_do_expediente']   # corrido == expediente
+            item = next(o for o in fora['operacoes'] if o['expediente_min'] == 960)
+            assert item['motivos'] == ['muito_acima_do_planejado']
+        finally:
+            self._limpar(aloc)
+
+    def test_nao_entra_na_media_nem_no_desvio(self, client):
+        normal = self._inserir(self.SEG.replace(hour=9), self.SEG.replace(hour=10), realizado=60, corrido=60, planejado=60)
+        base = next(m for m in self._stats(client)['desempenho_por_maquina'] if m['maquina'] == 'Torno Vertical')
+        suspeita = self._inserir(self.SEG.replace(hour=7), self.SEG + timedelta(days=1, hours=17), realizado=960, corrido=960,
+                                 planejado=120)
+        try:
+            depois = next(m for m in self._stats(client)['desempenho_por_maquina'] if m['maquina'] == 'Torno Vertical')
+            assert depois['tempo_realizado_medio_min'] == base['tempo_realizado_medio_min']
+            assert depois['desvio_medio_min'] == base['desvio_medio_min']
+            assert depois['operacoes_fora_do_calculo'] == base['operacoes_fora_do_calculo'] + 1
+        finally:
+            self._limpar(normal, suspeita)
+
+    def test_operacao_com_os_dois_motivos_conta_uma_vez_e_aparece_nos_dois(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']
+        aloc = self._inserir(self.SEG + timedelta(days=4, hours=16), self.SEG + timedelta(days=7, hours=8),
+                             realizado=1711, corrido=4231, planejado=150)
+        try:
+            fora = self._stats(client)['operacoes_fora_do_calculo']
+            assert fora['total'] == antes['total'] + 1
+            assert fora['por_motivo']['fora_do_expediente'] == antes['por_motivo']['fora_do_expediente'] + 1
+            assert fora['por_motivo']['muito_acima_do_planejado'] == antes['por_motivo']['muito_acima_do_planejado'] + 1
+            item = next(o for o in fora['operacoes'] if o['corrido_min'] == 4231 and o['expediente_min'] == 1711)
+            assert item['motivos'] == ['fora_do_expediente', 'muito_acima_do_planejado']
+        finally:
+            self._limpar(aloc)
+
+    def test_exatamente_o_dobro_continua_no_calculo(self, client):
+        antes = self._stats(client)['operacoes_fora_do_calculo']['total']
+        aloc = self._inserir(self.SEG.replace(hour=7), self.SEG.replace(hour=11), realizado=240, corrido=240, planejado=120)
+        try:
+            assert self._stats(client)['operacoes_fora_do_calculo']['total'] == antes
+        finally:
+            self._limpar(aloc)
+
+    def test_fator_configuravel_muda_a_exclusao(self, client, monkeypatch):
+        aloc = self._inserir(self.SEG.replace(hour=7), self.SEG.replace(hour=14), realizado=420, corrido=420, planejado=120)   # 3,5x
+        try:
+            monkeypatch.setattr(app_module, 'OPERACAO_ESQUECIDA_FATOR', 4.0)
+            antes = self._stats(client)['operacoes_fora_do_calculo']['total']
+            monkeypatch.setattr(app_module, 'OPERACAO_ESQUECIDA_FATOR', 3.0)
+            assert self._stats(client)['operacoes_fora_do_calculo']['total'] == antes + 1
+        finally:
+            self._limpar(aloc)
+
+    def test_operacoes_endpoint_traz_os_motivos(self, client):
+        r = client.post('/api/notas', data=json.dumps({'peca_codigo': '40-091799', 'quantidade': 1}),
+                        content_type='application/json')
+        os_id = json.loads(r.data)['processamento']['os_id']
+        ops = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)
+        conn = app_module.get_db()
+        try:
+            conn.execute("""UPDATE alocacao_maquinas SET status='CONCLUIDO', inicio_real='2031-03-10T07:00:00',
+                            fim_real='2031-03-11T17:00:00', tempo_realizado_min=960, tempo_realizado_corrido_min=960
+                            WHERE id = ?""", (ops[0]['id'],))
+            conn.commit()
+        finally:
+            conn.close()
+        op = json.loads(client.get(f'/api/ordens-servico/{os_id}/operacoes').data)[0]
+        assert op['excluida_dos_indicadores'] is True and op['motivos_de_exclusao'] == ['muito_acima_do_planejado']
+        assert op['fora_do_expediente'] is False          # o horário não é o motivo aqui
